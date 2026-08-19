@@ -149,6 +149,10 @@ pub fn format_diagnostics(
     output.push_str(&format!("Duplicates: {}\n", trade_proc.duplicate_trades()));
     output.push_str(&format!("Stale: {}\n", trade_proc.stale_trades()));
     output.push_str(&format!(
+        "Marker Events Rejected: {}\n",
+        trade_proc.marker_events_rejected()
+    ));
+    output.push_str(&format!(
         "Buy Aggressors: {}\n",
         trade_proc.buy_aggressor_count()
     ));

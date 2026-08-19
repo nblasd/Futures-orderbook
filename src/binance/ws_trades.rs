@@ -120,6 +120,14 @@ impl TradeWebSocketClient {
 
                                 match serde_json::from_str::<FuturesTrade>(&text) {
                                     Ok(trade) => {
+                                        // Log full raw JSON for any trade with zero price
+                                        // to diagnose Price: 0.00 display issue
+                                        if trade.price == "0"
+                                            || trade.price == "0.0"
+                                            || trade.price == "0.00"
+                                        {
+                                            warn!("ZERO-PRICE TRADE: raw_payload={}", &text);
+                                        }
                                         debug!(
                                             "Trade: id={}, price={}, qty={}, maker={}",
                                             trade.trade_id,

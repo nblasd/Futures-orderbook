@@ -934,7 +934,16 @@ fn test_multiple_bid_updates_same_price() {
 // ============================================================================
 
 use futures_orderbook::binance::trade_types::FuturesTrade;
-use futures_orderbook::trades::normalizer::normalize_trade;
+use futures_orderbook::trades::normalizer::{normalize_trade, NormalizeResult};
+use futures_orderbook::trades::trade::TradeEvent;
+
+/// Helper: extract TradeEvent from NormalizeResult, panicking on non-Ok.
+fn unwrap_trade(result: NormalizeResult) -> TradeEvent {
+    match result {
+        NormalizeResult::Ok(t) => t,
+        other => panic!("Expected NormalizeResult::Ok, got {:?}", other),
+    }
+}
 use futures_orderbook::trades::processor::{TradeProcessResult, TradeProcessor};
 use futures_orderbook::trades::trade::AggressorSide;
 use std::path::PathBuf;
@@ -1011,7 +1020,7 @@ fn test_33_parse_bad_price() {
     let trade: FuturesTrade = serde_json::from_str(&json).unwrap();
     // Normalization should fail on bad price
     let result = normalize_trade(&trade);
-    assert!(result.is_err());
+    assert!(matches!(result, NormalizeResult::ParseError(_)));
 }
 
 #[test]
@@ -1033,14 +1042,14 @@ fn test_35_parse_large_trade_fixture() {
 #[test]
 fn test_36_normalize_preserves_price_ticks() {
     let raw = make_raw_trade(1, "50000.10", "1.0", false);
-    let event = normalize_trade(&raw).unwrap();
+    let event = unwrap_trade(normalize_trade(&raw));
     assert_eq!(event.price_ticks, price_str_to_ticks("50000.10").unwrap());
 }
 
 #[test]
 fn test_37_normalize_preserves_quantity_ticks() {
     let raw = make_raw_trade(1, "100.00", "0.001", false);
-    let event = normalize_trade(&raw).unwrap();
+    let event = unwrap_trade(normalize_trade(&raw));
     assert_eq!(event.quantity_ticks, 100_000); // 0.001 * 1e8
 }
 
@@ -1049,7 +1058,7 @@ fn test_38_normalize_preserves_timestamps() {
     let mut raw = make_raw_trade(1, "100.00", "0.01", false);
     raw.event_time = 12345;
     raw.trade_time = 67890;
-    let event = normalize_trade(&raw).unwrap();
+    let event = unwrap_trade(normalize_trade(&raw));
     assert_eq!(event.event_time, 12345);
     assert_eq!(event.trade_time, 67890);
 }
@@ -1057,7 +1066,7 @@ fn test_38_normalize_preserves_timestamps() {
 #[test]
 fn test_39_normalize_preserves_trade_id() {
     let raw = make_raw_trade(9876543, "100.00", "0.01", false);
-    let event = normalize_trade(&raw).unwrap();
+    let event = unwrap_trade(normalize_trade(&raw));
     assert_eq!(event.trade_id, 9876543);
 }
 
@@ -1065,14 +1074,14 @@ fn test_39_normalize_preserves_trade_id() {
 fn test_40_normalize_preserves_order_type() {
     let mut raw = make_raw_trade(1, "100.00", "0.01", false);
     raw.order_type = "LIMIT".to_string();
-    let event = normalize_trade(&raw).unwrap();
+    let event = unwrap_trade(normalize_trade(&raw));
     assert_eq!(event.order_type, "LIMIT");
 }
 
 #[test]
 fn test_41_normalize_local_receive_time_nonzero() {
     let raw = make_raw_trade(1, "100.00", "0.01", false);
-    let event = normalize_trade(&raw).unwrap();
+    let event = unwrap_trade(normalize_trade(&raw));
     assert!(event.local_receive_time_ns > 0);
 }
 
@@ -1081,14 +1090,14 @@ fn test_41_normalize_local_receive_time_nonzero() {
 #[test]
 fn test_42_buyer_maker_true_means_sell_aggressor() {
     let raw = make_raw_trade(1, "64000.00", "0.01", true);
-    let event = normalize_trade(&raw).unwrap();
+    let event = unwrap_trade(normalize_trade(&raw));
     assert_eq!(event.aggressor, AggressorSide::Sell);
 }
 
 #[test]
 fn test_43_buyer_maker_false_means_buy_aggressor() {
     let raw = make_raw_trade(1, "64000.00", "0.01", false);
-    let event = normalize_trade(&raw).unwrap();
+    let event = unwrap_trade(normalize_trade(&raw));
     assert_eq!(event.aggressor, AggressorSide::Buy);
 }
 
@@ -1110,8 +1119,8 @@ fn test_45_aggressor_side_display() {
 fn test_46_duplicate_trade_detected() {
     let mut proc = TradeProcessor::new();
     let raw = make_raw_trade(100, "64000.00", "0.01", false);
-    let e1 = normalize_trade(&raw).unwrap();
-    let e2 = normalize_trade(&raw).unwrap();
+    let e1 = unwrap_trade(normalize_trade(&raw));
+    let e2 = unwrap_trade(normalize_trade(&raw));
     assert_eq!(proc.process(e1), TradeProcessResult::Processed);
     assert_eq!(proc.process(e2), TradeProcessResult::Duplicate);
     assert_eq!(proc.duplicate_trades(), 1);
@@ -1121,9 +1130,15 @@ fn test_46_duplicate_trade_detected() {
 #[test]
 fn test_47_stale_trade_detected() {
     let mut proc = TradeProcessor::new();
-    let e1 = normalize_trade(&make_raw_trade(50, "64000.00", "0.01", false)).unwrap();
-    let e2 = normalize_trade(&make_raw_trade(100, "64000.00", "0.01", false)).unwrap();
-    let e3 = normalize_trade(&make_raw_trade(40, "64000.00", "0.01", false)).unwrap();
+    let e1 = unwrap_trade(normalize_trade(&make_raw_trade(
+        50, "64000.00", "0.01", false,
+    )));
+    let e2 = unwrap_trade(normalize_trade(&make_raw_trade(
+        100, "64000.00", "0.01", false,
+    )));
+    let e3 = unwrap_trade(normalize_trade(&make_raw_trade(
+        40, "64000.00", "0.01", false,
+    )));
     assert_eq!(proc.process(e1), TradeProcessResult::Processed);
     assert_eq!(proc.process(e2), TradeProcessResult::Processed);
     assert_eq!(proc.process(e3), TradeProcessResult::Stale);
@@ -1133,8 +1148,12 @@ fn test_47_stale_trade_detected() {
 #[test]
 fn test_48_aggressor_counts_in_processor() {
     let mut proc = TradeProcessor::new();
-    let buy = normalize_trade(&make_raw_trade(1, "64000.00", "0.01", false)).unwrap();
-    let sell = normalize_trade(&make_raw_trade(2, "64000.00", "0.01", true)).unwrap();
+    let buy = unwrap_trade(normalize_trade(&make_raw_trade(
+        1, "64000.00", "0.01", false,
+    )));
+    let sell = unwrap_trade(normalize_trade(&make_raw_trade(
+        2, "64000.00", "0.01", true,
+    )));
     proc.process(buy);
     proc.process(sell);
     assert_eq!(proc.buy_aggressor_count(), 1);
@@ -1146,7 +1165,7 @@ fn test_49_sequential_trades_100() {
     let mut proc = TradeProcessor::new();
     for i in 1..=100 {
         let raw = make_raw_trade(i, "64000.00", "0.01", i % 2 == 0);
-        let event = normalize_trade(&raw).unwrap();
+        let event = unwrap_trade(normalize_trade(&raw));
         assert_eq!(proc.process(event), TradeProcessResult::Processed);
     }
     assert_eq!(proc.trade_events_processed(), 100);
@@ -1158,7 +1177,7 @@ fn test_50_last_trade_stored() {
     let mut proc = TradeProcessor::new();
     assert!(proc.last_trade().is_none());
     let raw = make_raw_trade(42, "64000.00", "0.01", true);
-    let event = normalize_trade(&raw).unwrap();
+    let event = unwrap_trade(normalize_trade(&raw));
     proc.process(event);
     let last = proc.last_trade().unwrap();
     assert_eq!(last.trade_id, 42);
@@ -1184,7 +1203,7 @@ fn test_51_trade_does_not_affect_order_book() {
     let mut proc = TradeProcessor::new();
     for i in 1..=10 {
         let raw = make_raw_trade(i, "50000.50", "0.001", i % 2 == 0);
-        let event = normalize_trade(&raw).unwrap();
+        let event = unwrap_trade(normalize_trade(&raw));
         proc.process(event);
     }
 
@@ -1215,4 +1234,119 @@ fn test_53_depth_stream_url_is_lowercase() {
         "URL should use lowercase: {}",
         url
     );
+}
+
+// --- Marker event rejection tests ---
+
+#[test]
+fn test_54_marker_event_regression_fixture() {
+    // Exact payload captured from live Binance Futures btcusdt@trade stream.
+    // This is NOT a real trade — it is a synthetic marker with p:"0", q:"0", X:"NA".
+    let json = load_fixture("trade_marker_event.json");
+    let trade: FuturesTrade = serde_json::from_str(&json).unwrap();
+    assert_eq!(trade.price, "0");
+    assert_eq!(trade.quantity, "0");
+    assert_eq!(trade.order_type, "NA");
+    assert_eq!(trade.symbol, "BTCUSDT");
+    assert_eq!(trade.trade_id, 7979198979);
+
+    // Must be recognized as a marker event, NOT normalized into TradeEvent
+    let result = normalize_trade(&trade);
+    assert!(
+        matches!(result, NormalizeResult::MarkerEvent(_)),
+        "Marker event with p:0 q:0 X:NA must be rejected, got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_55_marker_event_never_produces_zero_price_ticks() {
+    // Verify that no code path produces a TradeEvent with price_ticks=0
+    let marker = FuturesTrade {
+        event_type: "trade".to_string(),
+        event_time: 1787150961497,
+        trade_time: 1787150961497,
+        symbol: "BTCUSDT".to_string(),
+        trade_id: 7979198979,
+        price: "0".to_string(),
+        quantity: "0".to_string(),
+        order_type: "NA".to_string(),
+        is_buyer_maker: true,
+        trade_type: 1,
+    };
+    let result = normalize_trade(&marker);
+    match result {
+        NormalizeResult::Ok(event) => {
+            panic!(
+                "Must not produce TradeEvent for marker. Got price_ticks={}",
+                event.price_ticks
+            );
+        }
+        NormalizeResult::MarkerEvent(_) => { /* expected */ }
+        NormalizeResult::ParseError(e) => {
+            panic!("ParseError is wrong type for marker: {}", e);
+        }
+    }
+}
+
+#[test]
+fn test_56_all_real_trades_have_nonzero_price() {
+    // Simulate the full normalization + processing pipeline
+    let real_trades = vec![
+        (1, "65000.00", "0.001", false),
+        (2, "65000.10", "1.500", true),
+        (3, "0.10", "0.001", false), // very small price but nonzero
+        (4, "99999.99", "10.000", true),
+    ];
+    for (id, price, qty, maker) in real_trades {
+        let raw = make_raw_trade(id, price, qty, maker);
+        match normalize_trade(&raw) {
+            NormalizeResult::Ok(event) => {
+                assert!(
+                    event.price_ticks > 0,
+                    "trade_id={}: price_ticks must be > 0",
+                    id
+                );
+                assert!(
+                    event.quantity_ticks > 0,
+                    "trade_id={}: quantity_ticks must be > 0",
+                    id
+                );
+            }
+            NormalizeResult::MarkerEvent(_) => {
+                panic!("trade_id={}: real trade should not be marker", id);
+            }
+            NormalizeResult::ParseError(e) => {
+                panic!("trade_id={}: parse error: {}", id, e);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_57_processor_rejects_marker_without_processing() {
+    let mut proc = TradeProcessor::new();
+    // Simulate what main.rs does: normalize then process
+    let marker = FuturesTrade {
+        event_type: "trade".to_string(),
+        event_time: 1787150961497,
+        trade_time: 1787150961497,
+        symbol: "BTCUSDT".to_string(),
+        trade_id: 7979198979,
+        price: "0".to_string(),
+        quantity: "0".to_string(),
+        order_type: "NA".to_string(),
+        is_buyer_maker: true,
+        trade_type: 1,
+    };
+    let result = normalize_trade(&marker);
+    match result {
+        NormalizeResult::MarkerEvent(_) => {
+            proc.record_marker_rejected();
+        }
+        _ => panic!("Expected MarkerEvent"),
+    }
+    assert_eq!(proc.marker_events_rejected(), 1);
+    assert_eq!(proc.trade_events_received(), 0);
+    assert_eq!(proc.trade_events_processed(), 0);
 }

@@ -5,8 +5,6 @@ use tracing::debug;
 use super::trade::TradeEvent;
 
 /// Maximum number of recent trade IDs to retain for duplicate detection.
-/// This creates a bounded memory footprint while catching duplicates
-/// within a reasonable window (typically hundreds of recent trades).
 const DUPLICATE_WINDOW: usize = 4096;
 
 /// Result of processing a single trade event.
@@ -42,6 +40,8 @@ pub struct TradeProcessor {
     stale_trades: u64,
     /// Total malformed trade events.
     malformed_trade_events: u64,
+    /// Total synthetic marker events rejected (zero-price/NA order type).
+    marker_events_rejected: u64,
     /// Trade stream reconnect count.
     trade_reconnect_count: u64,
     /// Buy aggressor count.
@@ -62,6 +62,7 @@ impl TradeProcessor {
             duplicate_trades: 0,
             stale_trades: 0,
             malformed_trade_events: 0,
+            marker_events_rejected: 0,
             trade_reconnect_count: 0,
             buy_aggressor_count: 0,
             sell_aggressor_count: 0,
@@ -80,10 +81,7 @@ impl TradeProcessor {
             return TradeProcessResult::Duplicate;
         }
 
-        // Check ordering: trade ID should be greater than or equal to last
-        // We allow equality for the first trade, and >= for subsequent trades
-        // because Binance may not guarantee strictly monotonic trade IDs across
-        // all scenarios. However, if trade ID is strictly less than last, it's stale.
+        // Check ordering: trade ID should be >= last
         if let Some(last_id) = self.last_trade_id {
             if event.trade_id < last_id {
                 self.stale_trades += 1;
@@ -123,6 +121,11 @@ impl TradeProcessor {
         self.malformed_trade_events += 1;
     }
 
+    /// Record a synthetic marker event that was rejected.
+    pub fn record_marker_rejected(&mut self) {
+        self.marker_events_rejected += 1;
+    }
+
     // --- Metrics accessors ---
 
     pub fn trade_events_received(&self) -> u64 {
@@ -143,6 +146,10 @@ impl TradeProcessor {
 
     pub fn malformed_trade_events(&self) -> u64 {
         self.malformed_trade_events
+    }
+
+    pub fn marker_events_rejected(&self) -> u64 {
+        self.marker_events_rejected
     }
 
     pub fn trade_reconnect_count(&self) -> u64 {
@@ -193,11 +200,18 @@ mod tests {
         }
     }
 
+    fn normalize(raw: &FuturesTrade) -> TradeEvent {
+        match normalize_trade(raw) {
+            crate::trades::normalizer::NormalizeResult::Ok(e) => e,
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_process_normal_trade() {
         let mut proc = TradeProcessor::new();
         let raw = make_raw_trade(100, "64000.00", "0.01", false);
-        let event = normalize_trade(&raw).unwrap();
+        let event = normalize(&raw);
         let result = proc.process(event);
         assert_eq!(result, TradeProcessResult::Processed);
         assert_eq!(proc.trade_events_received(), 1);
@@ -209,13 +223,13 @@ mod tests {
     fn test_duplicate_detection() {
         let mut proc = TradeProcessor::new();
         let raw = make_raw_trade(100, "64000.00", "0.01", false);
-        let event1 = normalize_trade(&raw).unwrap();
-        let event2 = normalize_trade(&raw).unwrap();
+        let event1 = normalize(&raw);
+        let event2 = normalize(&raw);
 
         assert_eq!(proc.process(event1), TradeProcessResult::Processed);
         assert_eq!(proc.process(event2), TradeProcessResult::Duplicate);
         assert_eq!(proc.duplicate_trades(), 1);
-        assert_eq!(proc.trade_events_processed(), 1); // Only 1 processed
+        assert_eq!(proc.trade_events_processed(), 1);
     }
 
     #[test]
@@ -225,9 +239,9 @@ mod tests {
         let raw_new = make_raw_trade(100, "64000.00", "0.01", false);
         let raw_older = make_raw_trade(40, "64000.00", "0.01", false);
 
-        let event_old = normalize_trade(&raw_old).unwrap();
-        let event_new = normalize_trade(&raw_new).unwrap();
-        let event_older = normalize_trade(&raw_older).unwrap();
+        let event_old = normalize(&raw_old);
+        let event_new = normalize(&raw_new);
+        let event_older = normalize(&raw_older);
 
         assert_eq!(proc.process(event_old), TradeProcessResult::Processed);
         assert_eq!(proc.process(event_new), TradeProcessResult::Processed);
@@ -239,7 +253,7 @@ mod tests {
     fn test_buyer_maker_true_sell_aggressor() {
         let mut proc = TradeProcessor::new();
         let raw = make_raw_trade(1, "64000.00", "0.01", true);
-        let event = normalize_trade(&raw).unwrap();
+        let event = normalize(&raw);
         proc.process(event);
         assert_eq!(proc.sell_aggressor_count(), 1);
         assert_eq!(proc.buy_aggressor_count(), 0);
@@ -249,7 +263,7 @@ mod tests {
     fn test_buyer_maker_false_buy_aggressor() {
         let mut proc = TradeProcessor::new();
         let raw = make_raw_trade(1, "64000.00", "0.01", false);
-        let event = normalize_trade(&raw).unwrap();
+        let event = normalize(&raw);
         proc.process(event);
         assert_eq!(proc.buy_aggressor_count(), 1);
         assert_eq!(proc.sell_aggressor_count(), 0);
@@ -273,12 +287,21 @@ mod tests {
     }
 
     #[test]
+    fn test_marker_rejected_counter() {
+        let mut proc = TradeProcessor::new();
+        assert_eq!(proc.marker_events_rejected(), 0);
+        proc.record_marker_rejected();
+        proc.record_marker_rejected();
+        assert_eq!(proc.marker_events_rejected(), 2);
+    }
+
+    #[test]
     fn test_last_trade_stored() {
         let mut proc = TradeProcessor::new();
         assert!(proc.last_trade().is_none());
 
         let raw = make_raw_trade(1, "64000.00", "0.01", false);
-        let event = normalize_trade(&raw).unwrap();
+        let event = normalize(&raw);
         proc.process(event);
 
         let last = proc.last_trade().unwrap();
@@ -291,12 +314,11 @@ mod tests {
         let mut proc = TradeProcessor::new();
         for i in 1..=100 {
             let raw = make_raw_trade(i, "64000.00", "0.01", i % 2 == 0);
-            let event = normalize_trade(&raw).unwrap();
+            let event = normalize(&raw);
             assert_eq!(proc.process(event), TradeProcessResult::Processed);
         }
         assert_eq!(proc.trade_events_processed(), 100);
         assert_eq!(proc.last_trade_id(), Some(100));
-        // 50 buys (odd IDs) + 50 sells (even IDs)
         assert_eq!(proc.buy_aggressor_count(), 50);
         assert_eq!(proc.sell_aggressor_count(), 50);
     }
@@ -304,18 +326,15 @@ mod tests {
     #[test]
     fn test_duplicate_window_eviction() {
         let mut proc = TradeProcessor::new();
-        // Fill the window beyond DUPLICATE_WINDOW
         let base_id = 100_000;
         for i in 0..(DUPLICATE_WINDOW as u64 + 100) {
             let raw = make_raw_trade(base_id + i, "64000.00", "0.01", false);
-            let event = normalize_trade(&raw).unwrap();
+            let event = normalize(&raw);
             proc.process(event);
         }
-        // The very first ID (base_id) should have been evicted from the window
-        // and should NOT be detected as duplicate if we see it again
+        // First ID evicted from window — stale, not duplicate
         let raw = make_raw_trade(base_id, "64000.00", "0.01", false);
-        let event = normalize_trade(&raw).unwrap();
-        // This will be Stale (trade_id < last_trade_id) not Duplicate
+        let event = normalize(&raw);
         assert_eq!(proc.process(event), TradeProcessResult::Stale);
     }
 }

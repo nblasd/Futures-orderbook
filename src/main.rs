@@ -11,7 +11,7 @@ use futures_orderbook::config::Config;
 use futures_orderbook::diagnostics::format_diagnostics;
 use futures_orderbook::events::MarketEvent;
 use futures_orderbook::orderbook::{OrderBook, SyncState, Synchronizer};
-use futures_orderbook::trades::normalizer::normalize_trade;
+use futures_orderbook::trades::normalizer::{normalize_trade, NormalizeResult};
 use futures_orderbook::trades::processor::TradeProcessor;
 
 /// Snapshot fetch timeout.
@@ -116,67 +116,90 @@ async fn main() -> anyhow::Result<()> {
                         let evt_tx = event_tx.clone();
                         let symbol = config.symbol.clone();
                         tokio::spawn(async move {
-                            match tokio::time::timeout(SNAPSHOT_TIMEOUT, rest.fetch_depth_snapshot()).await {
-                                Err(_) => {
-                                    error!("REST snapshot timed out after {:?}", SNAPSHOT_TIMEOUT);
-                                }
-                                Ok(Err(e)) => {
-                                    error!("REST snapshot failed: {}", e);
-                                }
-                                Ok(Ok(snapshot)) => {
-                                    info!(">>> SNAPSHOT RECEIVED — lastUpdateId={}", snapshot.last_update_id);
-
-                                    let mut s = sync_clone.write().await;
-                                    s.on_snapshot_loading();
-                                    drop(s);
-
-                                    let mut b = book_clone.write().await;
-                                    if let Err(e) = b.apply_snapshot(
-                                        &snapshot.bids,
-                                        &snapshot.asks,
-                                        snapshot.last_update_id,
-                                    ) {
-                                        error!("Failed to apply snapshot to book: {}", e);
-                                        return;
+                            const MAX_SNAPSHOT_RETRIES: u32 = 5;
+                            for attempt in 1..=MAX_SNAPSHOT_RETRIES {
+                                info!("Snapshot fetch attempt {}/{}", attempt, MAX_SNAPSHOT_RETRIES);
+                                match tokio::time::timeout(SNAPSHOT_TIMEOUT, rest.fetch_depth_snapshot()).await {
+                                    Err(_) => {
+                                        error!("REST snapshot timed out after {:?}", SNAPSHOT_TIMEOUT);
+                                        let mut s = sync_clone.write().await;
+                                        s.trigger_resync();
+                                        drop(s);
+                                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                                        continue;
                                     }
-                                    drop(b);
+                                    Ok(Err(e)) => {
+                                        error!("REST snapshot failed: {}", e);
+                                        let mut s = sync_clone.write().await;
+                                        s.trigger_resync();
+                                        drop(s);
+                                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                                        continue;
+                                    }
+                                    Ok(Ok(snapshot)) => {
+                                        info!(">>> SNAPSHOT RECEIVED — lastUpdateId={}", snapshot.last_update_id);
 
-                                    let mut s = sync_clone.write().await;
-                                    info!(">>> SYNCHRONIZING — reconciling buffered events");
-                                    match s.reconcile(snapshot.last_update_id) {
-                                        Ok(events) => {
-                                            info!(
-                                                "Reconciled {} buffered events",
-                                                events.len()
-                                            );
-                                            let mut b = book_clone.write().await;
-                                            for event in &events {
-                                                if let Err(e) = b.apply_depth_update(
-                                                    &event.bids,
-                                                    &event.asks,
-                                                    event.final_update_id,
-                                                ) {
-                                                    error!("Failed to apply reconciled event: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                            drop(b);
+                                        let mut s = sync_clone.write().await;
+                                        s.on_snapshot_loading();
+                                        drop(s);
 
-                                            info!(">>> READY — order book synchronized");
-                                            let _ = evt_tx.send(MarketEvent::OrderBookSynchronized {
-                                                symbol,
-                                                last_update_id: snapshot.last_update_id,
-                                                bid_levels: 0,
-                                                ask_levels: 0,
-                                            });
+                                        let mut b = book_clone.write().await;
+                                        if let Err(e) = b.apply_snapshot(
+                                            &snapshot.bids,
+                                            &snapshot.asks,
+                                            snapshot.last_update_id,
+                                        ) {
+                                            error!("Failed to apply snapshot to book: {}", e);
+                                            return;
                                         }
-                                        Err(e) => {
-                                            warn!("Synchronization failed: {}, triggering resync", e);
-                                            s.trigger_resync();
+                                        drop(b);
+
+                                        let mut s = sync_clone.write().await;
+                                        info!(">>> SYNCHRONIZING — reconciling buffered events");
+                                        match s.reconcile(snapshot.last_update_id) {
+                                            Ok(events) => {
+                                                info!(
+                                                    "Reconciled {} buffered events",
+                                                    events.len()
+                                                );
+                                                let mut b = book_clone.write().await;
+                                                for event in &events {
+                                                    if let Err(e) = b.apply_depth_update(
+                                                        &event.bids,
+                                                        &event.asks,
+                                                        event.final_update_id,
+                                                    ) {
+                                                        error!("Failed to apply reconciled event: {}", e);
+                                                        break;
+                                                    }
+                                                }
+                                                drop(b);
+
+                                                info!(">>> READY — order book synchronized");
+                                                let _ = evt_tx.send(MarketEvent::OrderBookSynchronized {
+                                                    symbol,
+                                                    last_update_id: snapshot.last_update_id,
+                                                    bid_levels: 0,
+                                                    ask_levels: 0,
+                                                });
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Reconcile failed (attempt {}/{}): {}",
+                                                    attempt, MAX_SNAPSHOT_RETRIES, e
+                                                );
+                                                s.trigger_resync();
+                                                drop(s);
+                                                // Wait for depth events to accumulate before retrying
+                                                tokio::time::sleep(Duration::from_millis(1000)).await;
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
                             }
+                            error!("Failed to synchronize order book after {} snapshot attempts", MAX_SNAPSHOT_RETRIES);
                         });
                     }
                     Some(WsMessage::Disconnected) => {
@@ -255,53 +278,71 @@ async fn main() -> anyhow::Result<()> {
                                         let evt_tx = event_tx.clone();
                                         let symbol = config.symbol.clone();
                                         tokio::spawn(async move {
-                                            match tokio::time::timeout(SNAPSHOT_TIMEOUT, rest.fetch_depth_snapshot()).await {
-                                                Err(_) => {
-                                                    error!("RESYNC snapshot timed out");
-                                                }
-                                                Ok(Err(e)) => {
-                                                    error!("RESYNC snapshot failed: {}", e);
-                                                }
-                                                Ok(Ok(snapshot)) => {
-                                                    info!("RESYNC snapshot received: lastUpdateId={}", snapshot.last_update_id);
-                                                    let mut s = sync_clone.write().await;
-                                                    s.on_snapshot_loading();
-                                                    drop(s);
-                                                    let mut b = book_clone.write().await;
-                                                    if let Err(e) = b.apply_snapshot(
-                                                        &snapshot.bids,
-                                                        &snapshot.asks,
-                                                        snapshot.last_update_id,
-                                                    ) {
-                                                        error!("Failed to apply resync snapshot: {}", e);
-                                                        return;
+                                            const MAX_RESYNC_RETRIES: u32 = 5;
+                                            for attempt in 1..=MAX_RESYNC_RETRIES {
+                                                match tokio::time::timeout(SNAPSHOT_TIMEOUT, rest.fetch_depth_snapshot()).await {
+                                                    Err(_) => {
+                                                        error!("RESYNC snapshot timed out (attempt {}/{})", attempt, MAX_RESYNC_RETRIES);
+                                                        let mut s = sync_clone.write().await;
+                                                        s.trigger_resync();
+                                                        drop(s);
+                                                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                                                        continue;
                                                     }
-                                                    drop(b);
-                                                    let mut s = sync_clone.write().await;
-                                                    match s.reconcile(snapshot.last_update_id) {
-                                                        Ok(events) => {
-                                                            let mut b = book_clone.write().await;
-                                                            for event in &events {
-                                                                let _ = b.apply_depth_update(
-                                                                    &event.bids,
-                                                                    &event.asks,
-                                                                    event.final_update_id,
-                                                                );
-                                                            }
-                                                            drop(b);
-                                                            info!("RESYNC completed — READY");
-                                                            let _ = evt_tx.send(MarketEvent::OrderBookResyncCompleted {
-                                                                symbol,
-                                                                last_update_id: snapshot.last_update_id,
-                                                            });
+                                                    Ok(Err(e)) => {
+                                                        error!("RESYNC snapshot failed: {} (attempt {}/{})", e, attempt, MAX_RESYNC_RETRIES);
+                                                        let mut s = sync_clone.write().await;
+                                                        s.trigger_resync();
+                                                        drop(s);
+                                                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                                                        continue;
+                                                    }
+                                                    Ok(Ok(snapshot)) => {
+                                                        info!("RESYNC snapshot received: lastUpdateId={}", snapshot.last_update_id);
+                                                        let mut s = sync_clone.write().await;
+                                                        s.on_snapshot_loading();
+                                                        drop(s);
+                                                        let mut b = book_clone.write().await;
+                                                        if let Err(e) = b.apply_snapshot(
+                                                            &snapshot.bids,
+                                                            &snapshot.asks,
+                                                            snapshot.last_update_id,
+                                                        ) {
+                                                            error!("Failed to apply resync snapshot: {}", e);
+                                                            return;
                                                         }
-                                                        Err(e) => {
-                                                            warn!("RESYNC reconcile failed: {}", e);
-                                                            s.trigger_resync();
+                                                        drop(b);
+                                                        let mut s = sync_clone.write().await;
+                                                        match s.reconcile(snapshot.last_update_id) {
+                                                            Ok(events) => {
+                                                                let mut b = book_clone.write().await;
+                                                                for event in &events {
+                                                                    let _ = b.apply_depth_update(
+                                                                        &event.bids,
+                                                                        &event.asks,
+                                                                        event.final_update_id,
+                                                                    );
+                                                                }
+                                                                drop(b);
+                                                                info!("RESYNC completed — READY");
+                                                                let _ = evt_tx.send(MarketEvent::OrderBookResyncCompleted {
+                                                                    symbol,
+                                                                    last_update_id: snapshot.last_update_id,
+                                                                });
+                                                                return;
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("RESYNC reconcile failed: {} (attempt {}/{})", e, attempt, MAX_RESYNC_RETRIES);
+                                                                s.trigger_resync();
+                                                                drop(s);
+                                                                tokio::time::sleep(Duration::from_millis(1000)).await;
+                                                                continue;
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
+                                            error!("Failed to resync order book after {} attempts", MAX_RESYNC_RETRIES);
                                         });
                                     }
                                     futures_orderbook::orderbook::ProcessResult::Stale => {
@@ -351,7 +392,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Some(TradeWsMessage::Trade(raw)) => {
                         match normalize_trade(&raw) {
-                            Ok(event) => {
+                            NormalizeResult::Ok(event) => {
                                 let mut tp = trade_proc.write().await;
                                 use futures_orderbook::trades::processor::TradeProcessResult;
                                 match tp.process(event.clone()) {
@@ -368,10 +409,20 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 drop(tp);
                             }
-                            Err(e) => {
+                            NormalizeResult::MarkerEvent(marker) => {
+                                debug!(
+                                    "Rejected marker event: trade_id={}, price={}, qty={}, order_type={}",
+                                    marker.trade_id, marker.price, marker.quantity, marker.order_type
+                                );
+                                let mut tp = trade_proc.write().await;
+                                tp.record_marker_rejected();
+                                drop(tp);
+                            }
+                            NormalizeResult::ParseError(e) => {
                                 warn!("Failed to normalize trade: {}", e);
                                 let mut tp = trade_proc.write().await;
                                 tp.record_malformed();
+                                drop(tp);
                             }
                         }
                     }
