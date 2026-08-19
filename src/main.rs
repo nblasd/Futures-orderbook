@@ -5,11 +5,14 @@ use clap::Parser;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
-use futures_orderbook::binance::{RestClient, WebSocketClient, WsMessage};
+use futures_orderbook::binance::TradeWsMessage;
+use futures_orderbook::binance::{RestClient, TradeWebSocketClient, WebSocketClient, WsMessage};
 use futures_orderbook::config::Config;
 use futures_orderbook::diagnostics::format_diagnostics;
 use futures_orderbook::events::MarketEvent;
 use futures_orderbook::orderbook::{OrderBook, SyncState, Synchronizer};
+use futures_orderbook::trades::normalizer::normalize_trade;
+use futures_orderbook::trades::processor::TradeProcessor;
 
 /// Snapshot fetch timeout.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,12 +37,15 @@ async fn main() -> anyhow::Result<()> {
     info!("Market: Binance USDⓈ-M Futures");
     info!("REST base: {}", config.rest_base);
     info!("WebSocket base: {}", config.ws_base);
-    info!("Stream: {}", config.depth_stream_url());
+    info!("Depth stream: {}", config.depth_stream_url());
+    info!("Trade stream: {}", config.trade_stream_url());
     info!("========================================");
 
     // Create shared state
     let book = Arc::new(RwLock::new(OrderBook::new()));
     let sync = Arc::new(RwLock::new(Synchronizer::new()));
+    let trade_proc = Arc::new(RwLock::new(TradeProcessor::new()));
+    let trade_connected = Arc::new(RwLock::new(false));
 
     // Set initial state to Connecting
     {
@@ -49,13 +55,22 @@ async fn main() -> anyhow::Result<()> {
 
     // Channels
     let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let (trade_ws_tx, mut trade_ws_rx) = mpsc::unbounded_channel::<TradeWsMessage>();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MarketEvent>();
 
-    // Start WebSocket client in a background task
+    // Start depth WebSocket client
     let ws_client = WebSocketClient::new(config.clone());
     let ws_handle = tokio::spawn(async move {
         if let Err(e) = ws_client.run(ws_tx).await {
-            error!("WebSocket client fatal error: {}", e);
+            error!("Depth WebSocket client fatal error: {}", e);
+        }
+    });
+
+    // Start trade WebSocket client
+    let trade_ws_client = TradeWebSocketClient::new(config.clone());
+    let trade_ws_handle = tokio::spawn(async move {
+        if let Err(e) = trade_ws_client.run(trade_ws_tx).await {
+            error!("Trade WebSocket client fatal error: {}", e);
         }
     });
 
@@ -70,7 +85,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // State: are we waiting for a snapshot?
     let mut awaiting_snapshot: bool = false;
 
     loop {
@@ -87,16 +101,14 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
 
-            // Handle WebSocket messages
+            // Handle depth WebSocket messages
             msg = ws_rx.recv() => {
                 match msg {
                     Some(WsMessage::Connected) => {
-                        info!(">>> CONNECTED — entering Buffering state");
+                        info!(">>> DEPTH CONNECTED — entering Buffering state");
                         let mut s = sync.write().await;
                         s.on_connected();
                         info!(">>> SNAPSHOT REQUESTED — fetching REST order book");
-                        // Immediately spawn snapshot fetch as a separate task so we don't
-                        // block the select loop and can continue buffering depth events.
                         awaiting_snapshot = true;
                         let rest = RestClient::new(config.clone());
                         let book_clone = Arc::clone(&book);
@@ -107,7 +119,6 @@ async fn main() -> anyhow::Result<()> {
                             match tokio::time::timeout(SNAPSHOT_TIMEOUT, rest.fetch_depth_snapshot()).await {
                                 Err(_) => {
                                     error!("REST snapshot timed out after {:?}", SNAPSHOT_TIMEOUT);
-                                    // Signal failure via a special message or log
                                 }
                                 Ok(Err(e)) => {
                                     error!("REST snapshot failed: {}", e);
@@ -130,7 +141,6 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                     drop(b);
 
-                                    // Reconcile buffered events
                                     let mut s = sync_clone.write().await;
                                     info!(">>> SYNCHRONIZING — reconciling buffered events");
                                     match s.reconcile(snapshot.last_update_id) {
@@ -170,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
                         });
                     }
                     Some(WsMessage::Disconnected) => {
-                        warn!(">>> DISCONNECTED — WebSocket closed");
+                        warn!(">>> DEPTH DISCONNECTED — WebSocket closed");
                         let mut s = sync.write().await;
                         s.on_reconnecting();
                         awaiting_snapshot = false;
@@ -187,8 +197,6 @@ async fn main() -> anyhow::Result<()> {
 
                         match s.state() {
                             SyncState::Buffering => {
-                                // Buffer the event for later reconciliation with snapshot.
-                                // Don't try to fetch the snapshot here — it's already spawned.
                                 s.buffer_event(update);
                                 debug!(
                                     "Buffered event, buffer size={}, awaiting_snapshot={}",
@@ -241,7 +249,6 @@ async fn main() -> anyhow::Result<()> {
                                         s.trigger_resync();
                                         awaiting_snapshot = true;
 
-                                        // Spawn resync snapshot fetch
                                         let rest = RestClient::new(config.clone());
                                         let book_clone = Arc::clone(&book);
                                         let sync_clone = Arc::clone(&sync);
@@ -300,31 +307,79 @@ async fn main() -> anyhow::Result<()> {
                                     futures_orderbook::orderbook::ProcessResult::Stale => {
                                         debug!("Stale event ignored: u={}", update.final_update_id);
                                     }
-                                    futures_orderbook::orderbook::ProcessResult::Buffered => {
-                                        // Should not happen in Ready state
-                                    }
+                                    futures_orderbook::orderbook::ProcessResult::Buffered => {}
                                     futures_orderbook::orderbook::ProcessResult::Ignored => {}
                                 }
                             }
                             SyncState::Reconnecting => {
-                                // Buffer events while reconnecting
                                 s.buffer_event(update);
                             }
                             SyncState::SnapshotLoading | SyncState::Synchronizing => {
-                                // Buffer while snapshot/sync is in progress
                                 s.buffer_event(update);
                             }
                             _ => {
-                                debug!("Ignoring event in state {:?}", s.state());
+                                debug!("Ignoring depth event in state {:?}", s.state());
                             }
                         }
                     }
                     Some(WsMessage::Error(e)) => {
-                        warn!("WS ERROR: {}", e);
+                        warn!("DEPTH WS ERROR: {}", e);
                     }
                     None => {
-                        info!("WebSocket channel closed");
+                        info!("Depth WebSocket channel closed");
                         break;
+                    }
+                }
+            }
+
+            // Handle trade WebSocket messages
+            trade_msg = trade_ws_rx.recv() => {
+                match trade_msg {
+                    Some(TradeWsMessage::Connected) => {
+                        info!(">>> TRADE CONNECTED");
+                        {
+                            let mut tc = trade_connected.write().await;
+                            *tc = true;
+                        }
+                    }
+                    Some(TradeWsMessage::Disconnected) => {
+                        warn!(">>> TRADE DISCONNECTED");
+                        let mut tc = trade_connected.write().await;
+                        *tc = false;
+                        let mut tp = trade_proc.write().await;
+                        tp.on_trade_reconnect();
+                    }
+                    Some(TradeWsMessage::Trade(raw)) => {
+                        match normalize_trade(&raw) {
+                            Ok(event) => {
+                                let mut tp = trade_proc.write().await;
+                                use futures_orderbook::trades::processor::TradeProcessResult;
+                                match tp.process(event.clone()) {
+                                    TradeProcessResult::Processed => {
+                                        let _ = event_tx.send(MarketEvent::Trade(event));
+                                    }
+                                    TradeProcessResult::Duplicate => {
+                                        debug!("Duplicate trade ID: {}", event.trade_id);
+                                    }
+                                    TradeProcessResult::Stale => {
+                                        debug!("Stale trade ID: {}", event.trade_id);
+                                    }
+                                    TradeProcessResult::Ignored => {}
+                                }
+                                drop(tp);
+                            }
+                            Err(e) => {
+                                warn!("Failed to normalize trade: {}", e);
+                                let mut tp = trade_proc.write().await;
+                                tp.record_malformed();
+                            }
+                        }
+                    }
+                    Some(TradeWsMessage::Error(e)) => {
+                        warn!("TRADE WS ERROR: {}", e);
+                    }
+                    None => {
+                        info!("Trade WebSocket channel closed");
                     }
                 }
             }
@@ -333,24 +388,24 @@ async fn main() -> anyhow::Result<()> {
             _ = diagnostic_interval.tick() => {
                 let s = sync.read().await;
                 let b = book.read().await;
+                let tp = trade_proc.read().await;
+                let tc = *trade_connected.read().await;
                 let output = format_diagnostics(
                     &config.symbol,
                     s.state(),
                     &b,
                     &s,
+                    &tp,
+                    tc,
                     start_time,
                 );
-                // Clear screen and print
                 print!("\x1B[2J\x1B[H{}", output);
                 use std::io::Write;
                 std::io::stdout().flush().unwrap_or(());
             }
 
             // Drain internal events
-            _ = event_rx.recv() => {
-                // Events are consumed here; in future phases they'll drive
-                // heatmap, CVD, absorption, etc.
-            }
+            _ = event_rx.recv() => {}
         }
     }
 
@@ -361,6 +416,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     ws_handle.abort();
+    trade_ws_handle.abort();
     info!("Engine shutdown complete");
 
     Ok(())

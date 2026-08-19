@@ -1,267 +1,320 @@
-# Binance USDⓈ-M Futures BTCUSDT Order-Book Engine
+# Futures Order-Book Engine
 
-> **This Phase 1 engine represents the Binance BTCUSDT USDⓈ-M Futures order book. It must not be interpreted as the Binance Spot order book.**
+Real-time **Binance USDⓈ-M Futures BTCUSDT perpetual** order-book and trade-ingestion engine in Rust.
 
-A real-time local order-book engine for the Binance BTCUSDT USDⓈ-M perpetual futures contract. This is Phase 1 of a future Bookmap-style order-flow platform.
+> **This engine represents the Binance BTCUSDT USDⓈ-M Futures order book and executed trades. It must not be interpreted as the Binance Spot order book.**
+
+---
+
+## Overview
+
+Phase 1 provides a local order book synchronized against Binance Futures depth updates.
+
+Phase 2 adds real-time Futures executed-trade ingestion alongside the order book.
+
+```
+                  Binance USDⓈ-M Futures
+                         │
+             ┌───────────┴───────────┐
+             │                       │
+             ▼                       ▼
+      btcusdt@depth@100ms       btcusdt@trade
+             │                       │
+             ▼                       ▼
+       OrderBook Engine          Trade Engine
+             │                       │
+             └───────────┬───────────┘
+                         ▼
+                  MarketEvent Bus
+                         │
+                         ▼
+                 Diagnostics / Future
+                    Analytics
+```
+
+## Market Definition
+
+| Field | Value |
+|-------|-------|
+| Exchange | Binance |
+| Product | USDⓈ-M Futures |
+| Contract | BTCUSDT perpetual |
+| Symbol | BTCUSDT |
+| Tick Size | 0.10 |
+| Step Size | 0.001 BTC |
 
 ## Why USDⓈ-M Futures (Not Spot)
 
-This engine exclusively uses Binance's **USDⓈ-M Futures** APIs. It does **not** use:
+Our eventual order-flow analysis must compare Futures resting liquidity against Futures executed trades from the same market. Using Spot data would produce an inconsistent and misleading view of market microstructure.
 
-- Binance Spot APIs
-- Binance COIN-M Futures APIs
-- Any spot WebSocket streams or REST endpoints
+---
 
-The target market is the **BTCUSDT perpetual contract** on Binance USDⓈ-M Futures, which is the contract we will eventually trade.
+## Phase 1 — Local Order Book
 
-## BTCUSDT Perpetual Market Definition
-
-- **Exchange:** Binance
-- **Market type:** USDⓈ-M Futures
-- **Symbol:** BTCUSDT
-- **Contract type:** Perpetual
-- **Margin asset:** USDT
-- **Base asset:** BTC
-
-## Binance Futures REST Endpoint
+### REST Snapshot
 
 ```
 GET https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000
 ```
 
-Valid depth limits: `5, 10, 20, 50, 100, 500, 1000`
-
-Response fields:
-- `lastUpdateId` — last update ID in the snapshot
-- `bids` — array of `[price_string, quantity_string]`
-- `asks` — array of `[price_string, quantity_string]`
-- `T` — timestamp
-- `E` — last update time
-
-## Binance Futures WebSocket Endpoint
+### WebSocket Depth Stream
 
 ```
 wss://fstream.binance.com/ws/btcusdt@depth@100ms
 ```
 
-## Diff-Depth Message Structure
+**Stream names are lowercase and case-sensitive.**
+
+### Diff-Depth Message Structure
 
 ```json
 {
   "e": "depthUpdate",
-  "E": 123456789,
-  "T": 123456788,
+  "E": 1234567890000,
+  "T": 1234567890000,
   "s": "BTCUSDT",
-  "U": 150,
-  "u": 160,
-  "pu": 149,
-  "b": [["50000.10", "1.500"], ...],
-  "a": [["50000.20", "0.500"], ...]
+  "U": 100,
+  "u": 105,
+  "pu": 99,
+  "b": [["50000.10", "1.5"]],
+  "a": [["50000.20", "0.5"]]
 }
 ```
 
-Fields:
-- `e` — event type (`depthUpdate`)
-- `E` — event time (ms)
-- `T` — transaction time (ms)
-- `s` — symbol
-- `U` — first update ID in this event
-- `u` — final update ID in this event
-- `pu` — final update ID of the previous stream event (Futures-specific)
-- `b` — bid updates: `[price, quantity]` absolute values
-- `a` — ask updates: `[price, quantity]` absolute values
+### Synchronization Rules
 
-Each bid/ask update is an **absolute quantity** for that price level. If quantity is zero, the level is removed.
+1. Open WebSocket, buffer events.
+2. Fetch REST snapshot (`lastUpdateId`).
+3. Drop buffered events where `u < lastUpdateId`.
+4. First processed event must satisfy: `U ≤ lastUpdateId AND u ≥ lastUpdateId`.
+5. Each subsequent event must have: `event.pu == previous_event.u`.
+6. A `pu` mismatch triggers immediate resynchronization.
 
-## Local Order-Book Synchronization
+### Exact Numeric Representation
 
-The synchronization procedure follows Binance's official documentation:
+All prices and quantities stored as `u64` integer ticks scaled by 1e8. No `f64` used as authoritative keys. This guarantees exact equality comparison.
 
-1. **Open WebSocket** to `wss://fstream.binance.com/ws/btcusdt@depth@100ms`
-2. **Buffer** incoming depth events while waiting for the snapshot.
-3. **Fetch REST snapshot** from `GET /fapi/v1/depth?symbol=BTCUSDT&limit=1000`
-4. **Discard** buffered events where `u < lastUpdateId` from the snapshot.
-5. **Find the first bridging event** where `U <= lastUpdateId AND u >= lastUpdateId`.
-6. **Initialize** the local book from the snapshot.
-7. **Apply** the bridging event and all subsequent buffered events.
-8. **Continue** applying live events, validating `pu` continuity.
-9. **If continuity breaks:** invalidate the book, trigger resynchronization.
+---
 
-## `U`, `u`, and `pu` Semantics
+## Phase 2 — Futures Trade Ingestion
 
-- **`U`** (first_update_id): The first update ID covered by this event.
-- **`u`** (final_update_id): The last update ID covered by this event.
-- **`pu`** (previous_final_update_id): The `u` value of the immediately preceding event on the stream.
-
-**Synchronization invariant:**
+### Trade Stream
 
 ```
-First bridging event: U <= lastUpdateId AND u >= lastUpdateId
-Every subsequent event: event.pu == previous_event.u
+wss://fstream.binance.com/ws/btcusdt@trade
 ```
 
-The `pu` field is **Futures-specific** and is not available on Binance Spot.
+> **Note:** Binance Futures uses `@trade` for individual trade events, not `@aggTrade` (which is a Spot-only stream name).
 
-## Resynchronization Behavior
+### Futures Trade Payload
 
-When a sequence gap is detected (pu mismatch, missing events, or WebSocket reconnection):
-
-1. Mark the local book as invalid.
-2. Stop exposing it as authoritative.
-3. Trigger resynchronization:
-   - Clear the buffer.
-   - Reconnect WebSocket if needed.
-   - Buffer new depth events.
-   - Fetch a fresh REST snapshot.
-   - Reconcile buffered events.
-   - Return to READY only after sequence continuity is established.
-
-## Exact Price/Quantity Representation
-
-Prices and quantities are stored as **integer ticks** scaled by 10^8:
-
-```rust
-pub const TICK_SCALE: u64 = 100_000_000; // 1e8
+```json
+{
+  "e": "trade",
+  "E": 1787137583835,
+  "T": 1787137583835,
+  "s": "BTCUSDT",
+  "t": 7978350772,
+  "p": "64486.00",
+  "q": "0.002",
+  "X": "MARKET",
+  "m": false,
+  "st": 1
+}
 ```
 
-This guarantees **exact equality comparison** with no floating-point errors. A price of `50000.50` is stored as `5_000_050_000_000`.
+| Field | Meaning |
+|-------|---------|
+| `e` | Event type ("trade") |
+| `E` | Event time (ms) |
+| `T` | Trade time (ms) |
+| `s` | Symbol |
+| `t` | Trade ID |
+| `p` | Price (string) |
+| `q` | Quantity (string) |
+| `X` | Order type |
+| `m` | **Is buyer maker** |
+| `st` | Trade type |
 
-## Running the Application
+### Aggressor-Side Classification
+
+The `m` (is buyer maker) field determines which side aggressed:
+
+| Binance `m` | Buyer is maker? | Aggressor | AggressorSide |
+|-------------|-----------------|-----------|---------------|
+| `true`      | Yes             | Seller    | `Sell`        |
+| `false`     | No              | Buyer     | `Buy`         |
+
+The **aggressor** is the party that submitted a marketable order consuming resting liquidity.
+
+An **aggressive BUY** means a buyer consumed resting asks.
+
+An **aggressive SELL** means a seller consumed resting bids.
+
+This classification is critical for future CVD, delta, absorption, and sweep analysis.
+
+### Duplicate Detection
+
+A bounded window of 4096 recent trade IDs is maintained. If a trade ID is received twice within this window, it is flagged as a duplicate and not processed again. The window uses FIFO eviction to maintain a fixed memory footprint.
+
+### Trade and Order-Book Independence
+
+Trade events do NOT modify the order book. Order-book events do NOT modify trade state. Each stream has independent reconnection, error handling, and metrics. A trade-stream disconnection does not trigger an order-book resynchronization.
+
+---
+
+## Running
+
+### Prerequisites
+
+- Rust 1.70+ (with `cargo`)
+
+### Build
 
 ```bash
-# Build
+cd futures-orderbook
 cargo build --release
+```
 
-# Run with default settings (BTCUSDT, run indefinitely)
-cargo run --release
+### Run (Live)
 
-# Run with specific duration
+```bash
 cargo run --release -- --symbol BTCUSDT --duration 60
+```
 
-# Run with custom settings
-cargo run --release -- \
-    --symbol BTCUSDT \
-    --depth-limit 1000 \
-    --diagnostic-interval 2 \
-    --duration 120
+### Run (With Debug Logging)
+
+```bash
+RUST_LOG=debug cargo run --release -- --symbol BTCUSDT --duration 60
 ```
 
 ### CLI Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--symbol` | `BTCUSDT` | Trading symbol |
-| `--rest-base` | `https://fapi.binance.com` | REST API base URL |
-| `--ws-base` | `wss://fstream.binance.com` | WebSocket base URL |
-| `--depth-speed` | `100ms` | Depth update speed |
-| `--depth-limit` | `1000` | REST snapshot depth limit |
-| `--reconnect-base-ms` | `1000` | Reconnect base delay (ms) |
-| `--reconnect-max-ms` | `30000` | Reconnect max delay (ms) |
-| `--diagnostic-interval` | `2` | Diagnostic print interval (seconds) |
-| `--duration` | `0` | Run duration (0 = indefinite) |
+| `--symbol` | BTCUSDT | Trading symbol |
+| `--duration` | 0 (indefinite) | Run duration in seconds |
+| `--depth-speed` | 100ms | Depth update speed |
+| `--depth-limit` | 1000 | REST snapshot depth levels |
+| `--diagnostic-interval` | 2 | Diagnostic print interval (seconds) |
+| `--reconnect-base-ms` | 1000 | Reconnect base delay |
+| `--reconnect-max-ms` | 30000 | Reconnect max delay |
 
-## Running Tests
+---
+
+## Testing
+
+### Unit Tests + Integration Tests
 
 ```bash
-# Run all tests
 cargo test
-
-# Run only unit tests
-cargo test --lib
-
-# Run only integration tests
-cargo test --test integration_tests
-
-# Run with output
-cargo test -- --nocapture
 ```
 
-## Running the Live Integration Test
+### Format Check
+
+```bash
+cargo fmt --check
+```
+
+### Lint
+
+```bash
+cargo clippy
+```
+
+### Live Integration Test
 
 ```bash
 cargo run --release -- --symbol BTCUSDT --duration 60
 ```
 
-This will:
-1. Connect to Binance USDⓈ-M Futures WebSocket
-2. Subscribe to BTCUSDT depth stream
-3. Fetch Futures REST snapshot
-4. Synchronize local order book
-5. Process live updates
-6. Display diagnostics
-7. Exit cleanly after the specified duration
+The live test is successful if:
+- Both depth and trade WebSockets connect (HTTP 101)
+- REST snapshot is received
+- Order book reaches READY state
+- Best Bid and Best Ask are populated
+- Trades are received and processed
+- Buy/sell aggressor counts are non-zero
+- No unexplained resyncs or sequence errors
 
-## Diagnostic Output
+---
+
+## Diagnostics Output
 
 ```
 BTCUSDT PERPETUAL
 Market: Binance USDⓈ-M Futures
 
+Order Book
 Status: Ready
-
-Best Bid:  50000.10
-Best Ask:  50000.20
-Mid:       50000.15
+Best Bid:  65432.00
+Best Ask:  65432.10
+Mid:       65432.05
 Spread:    0.10
 
-Last Update ID: 12345
-Events Received: 5678
-Events Applied:  5670
-Events Ignored:  8
-Resyncs: 0
-Reconnects: 0
-Sequence Errors: 0
+Trades
+Status: CONNECTED
+Trades Received: 2308
+Trades Processed: 2308
+Duplicates: 0
+Buy Aggressors: 930
+Sell Aggressors: 1378
 
-Uptime: 60s
+Last Trade:
+  Price:     65432.10
+  Quantity:  0.0030
+  Aggressor: BUY
+  Trade ID:  7979165541
+
+Uptime: 54s
 Buffer size: 0
 ```
 
-## Known Limitations
-
-- Phase 1 only implements depth stream; trades, aggTrades, bookTicker, mark price, funding rate, and open interest are not yet implemented.
-- No database storage.
-- No frontend or visualization.
-- No trading functionality.
-- No absorption, CVD, sweep, or liquidity-wall detection.
-- Uses `f64` internally for string-to-tick conversion (immediately converted to exact integer ticks).
-- The engine does not handle Binance rate limits beyond basic reconnection backoff.
+---
 
 ## Architecture
 
 ```
-futures_orderbook
-├── src/
-│   ├── main.rs              # CLI entry point and engine loop
-│   ├── lib.rs               # Library root (exposes modules for testing)
-│   ├── config.rs            # Configuration and CLI arguments
-│   ├── error.rs             # Error types
-│   ├── binance/
-│   │   ├── mod.rs
-│   │   ├── rest.rs          # REST client for snapshots
-│   │   ├── websocket.rs     # WebSocket client with reconnection
-│   │   └── types.rs         # Binance API types (serde)
-│   ├── orderbook/
-│   │   ├── mod.rs
-│   │   ├── book.rs          # Core order book (BTreeMap-based)
-│   │   ├── level.rs         # Price levels with integer tick representation
-│   │   └── synchronizer.rs  # State machine and event reconciliation
-│   ├── events/
-│   │   ├── mod.rs
-│   │   └── market.rs        # MarketEvent enum for future phases
-│   └── diagnostics/
-│       └── mod.rs           # Metrics and diagnostic display
-└── tests/
-    ├── fixtures/             # JSON test fixtures (Futures payloads)
-    └── integration_tests.rs  # 39 comprehensive tests
+src/
+├── main.rs                    # Engine loop + CLI
+├── config.rs                  # CLI args + URL builders
+├── error.rs                   # Error types
+├── binance/
+│   ├── mod.rs
+│   ├── types.rs               # DepthUpdate, DepthSnapshot (serde)
+│   ├── trade_types.rs         # FuturesTrade (aggTrade serde)
+│   ├── rest.rs                # REST client (/fapi/v1/depth)
+│   ├── websocket.rs           # Depth WebSocket client
+│   └── ws_trades.rs           # Trade WebSocket client
+├── orderbook/
+│   ├── mod.rs
+│   ├── book.rs                # Core OrderBook (BTreeMap)
+│   ├── level.rs               # Integer tick representation
+│   └── synchronizer.rs        # State machine + reconciliation
+├── trades/
+│   ├── mod.rs
+│   ├── trade.rs               # TradeEvent + AggressorSide
+│   ├── normalizer.rs           # FuturesTrade → TradeEvent
+│   └── processor.rs            # Duplicate detection + metrics
+├── events/
+│   ├── mod.rs
+│   └── market.rs              # MarketEvent enum
+└── diagnostics/
+    └── mod.rs                 # CLI display + metrics
 ```
 
-## Test Coverage
+---
 
-- **39 tests** covering:
-  - Basic book operations (empty book, snapshot, insert, update, remove)
-  - Sequence handling (valid events, stale, duplicate, gap, pu mismatch)
-  - Precision (exact ticks, no floating-point errors, deterministic)
-  - Invariants (best bid/ask, no zero-quantity, no duplicates)
-  - Synchronization (full flow, resync, buffered event reconciliation)
-  - JSON deserialization (DepthUpdate, DepthSnapshot)
-  - Edge cases (removal of nonexistent levels, snapshot replacement)
+## Known Limitations
+
+- Phase 2 only implements the `btcusdt@trade` stream. The `@aggTrade` stream name does not exist on Binance Futures (it is Spot-only).
+- No database, frontend, or trading functionality.
+- No CVD, delta, absorption, or sweep analytics (deferred to later phases).
+- Price display uses 2 decimal places — very small tick values may display as 0.00 in diagnostics.
+- The 4096-entry duplicate window may miss duplicates that arrive after the window has evicted the original trade ID.
+
+---
+
+## License
+
+Internal project — not yet licensed for distribution.

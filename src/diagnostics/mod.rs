@@ -1,8 +1,9 @@
 use std::time::Instant;
 
 use crate::orderbook::{OrderBook, SyncState, Synchronizer};
+use crate::trades::processor::TradeProcessor;
 
-/// Metrics tracked by the engine.
+/// Metrics tracked by the order-book engine.
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub events_received: u64,
@@ -61,12 +62,14 @@ impl Metrics {
     }
 }
 
-/// Format the diagnostic display for the CLI.
+/// Format the combined diagnostic display for the CLI (order book + trades).
 pub fn format_diagnostics(
     symbol: &str,
     state: SyncState,
     book: &OrderBook,
     sync: &Synchronizer,
+    trade_proc: &TradeProcessor,
+    trade_connected: bool,
     start_time: Instant,
 ) -> String {
     let mut output = String::new();
@@ -74,7 +77,9 @@ pub fn format_diagnostics(
     output.push_str(&format!("{} PERPETUAL\n", symbol));
     output.push_str("Market: Binance USDⓈ-M Futures\n\n");
 
-    output.push_str(&format!("Status: {:?}\n\n", state));
+    // --- Order Book ---
+    output.push_str("Order Book\n");
+    output.push_str(&format!("Status: {:?}\n", state));
 
     if let Some(bid) = book.best_bid() {
         output.push_str(&format!(
@@ -121,6 +126,52 @@ pub fn format_diagnostics(
     output.push_str(&format!("Resyncs: {}\n", sync.resync_count()));
     output.push_str(&format!("Reconnects: {}\n", sync.reconnect_count()));
     output.push_str(&format!("Sequence Errors: {}\n", sync.sequence_errors()));
+    output.push('\n');
+
+    // --- Trades ---
+    output.push_str("Trades\n");
+    output.push_str(&format!(
+        "Status: {}\n",
+        if trade_connected {
+            "CONNECTED"
+        } else {
+            "DISCONNECTED"
+        }
+    ));
+    output.push_str(&format!(
+        "Trades Received: {}\n",
+        trade_proc.trade_events_received()
+    ));
+    output.push_str(&format!(
+        "Trades Processed: {}\n",
+        trade_proc.trade_events_processed()
+    ));
+    output.push_str(&format!("Duplicates: {}\n", trade_proc.duplicate_trades()));
+    output.push_str(&format!("Stale: {}\n", trade_proc.stale_trades()));
+    output.push_str(&format!(
+        "Buy Aggressors: {}\n",
+        trade_proc.buy_aggressor_count()
+    ));
+    output.push_str(&format!(
+        "Sell Aggressors: {}\n",
+        trade_proc.sell_aggressor_count()
+    ));
+
+    if let Some(last_trade) = trade_proc.last_trade() {
+        output.push('\n');
+        output.push_str("Last Trade:\n");
+        output.push_str(&format!(
+            "  Price:     {}\n",
+            crate::orderbook::level::ticks_to_price_str(last_trade.price_ticks)
+        ));
+        output.push_str(&format!(
+            "  Quantity:  {}\n",
+            crate::orderbook::level::ticks_to_quantity_str(last_trade.quantity_ticks)
+        ));
+        output.push_str(&format!("  Aggressor: {}\n", last_trade.aggressor.label()));
+        output.push_str(&format!("  Trade ID:  {}\n", last_trade.trade_id));
+    }
+
     output.push('\n');
 
     let elapsed = start_time.elapsed().as_secs();

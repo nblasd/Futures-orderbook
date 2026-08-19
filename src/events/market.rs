@@ -39,6 +39,9 @@ pub enum MarketEvent {
     /// Resynchronization has completed.
     OrderBookResyncCompleted { symbol: String, last_update_id: u64 },
 
+    /// A normalized trade event from the Futures trade stream.
+    Trade(crate::trades::trade::TradeEvent),
+
     /// Connection status has changed.
     ConnectionStatusChanged {
         symbol: String,

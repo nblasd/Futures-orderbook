@@ -57,6 +57,14 @@ impl Config {
         )
     }
 
+    /// Build the WebSocket stream URL for the Futures trade stream.
+    ///
+    /// Uses `btcusdt@trade` (not `@aggTrade` — Binance Futures uses
+    /// `@trade` for individual trade events).
+    pub fn trade_stream_url(&self) -> String {
+        format!("{}/ws/{}@trade", self.ws_base, self.symbol.to_lowercase())
+    }
+
     /// Build the REST depth endpoint URL.
     pub fn depth_rest_url(&self) -> String {
         format!(
