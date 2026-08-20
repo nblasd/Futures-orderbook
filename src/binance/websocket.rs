@@ -19,8 +19,13 @@ const MAX_RAW_LOG_PER_SECOND: usize = 5;
 /// Messages sent from the WebSocket client to the main engine.
 #[derive(Debug)]
 pub enum WsMessage {
-    /// A depth update event from the WebSocket.
-    DepthUpdate(DepthUpdate),
+    /// A depth update event from the WebSocket, with the raw payload
+    /// byte-for-byte and the local receive time (ns since Unix epoch).
+    DepthUpdate {
+        update: DepthUpdate,
+        raw: String,
+        local_receive_time_ns: u128,
+    },
     /// The WebSocket connection has been established.
     Connected,
     /// The WebSocket connection has been closed.
@@ -133,7 +138,12 @@ impl WebSocketClient {
                                             update.bids.len(),
                                             update.asks.len()
                                         );
-                                        let _ = tx.send(WsMessage::DepthUpdate(update));
+                                        let local_receive_time_ns = super::now_unix_nanos();
+                                        let _ = tx.send(WsMessage::DepthUpdate {
+                                            update,
+                                            raw: text.to_string(),
+                                            local_receive_time_ns,
+                                        });
                                     }
                                     Err(e) => {
                                         warn!(

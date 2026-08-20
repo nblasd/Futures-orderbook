@@ -1,25 +1,33 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use clap::Parser;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
-use futures_orderbook::binance::TradeWsMessage;
-use futures_orderbook::binance::{RestClient, TradeWebSocketClient, WebSocketClient, WsMessage};
-use futures_orderbook::config::Config;
-use futures_orderbook::diagnostics::format_diagnostics;
+use futures_orderbook::binance::{
+    RestClient, TradeWebSocketClient, TradeWsMessage, WebSocketClient, WsMessage,
+};
+use futures_orderbook::config::{Command, Config, ReplayArgs, VerifyArgs};
+use futures_orderbook::diagnostics::{format_diagnostics, format_storage_section};
 use futures_orderbook::events::MarketEvent;
 use futures_orderbook::orderbook::{OrderBook, SyncState, Synchronizer};
+use futures_orderbook::recording::{
+    detect_git_commit, start_recorder, NewTrade, RecordingConfig, SessionRecord, SessionStatus,
+};
+use futures_orderbook::replay::{load_session, run_replay, ReplayConfig, ReplayReport};
+use futures_orderbook::storage::{ClickHouseStorage, Storage};
 use futures_orderbook::trades::normalizer::{normalize_trade, NormalizeResult};
 use futures_orderbook::trades::processor::TradeProcessor;
+use futures_orderbook::verify::verify_session;
 
 /// Snapshot fetch timeout.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -29,6 +37,96 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+
+    match &config.command {
+        Some(Command::Replay(args)) => cmd_replay(&config, args).await,
+        Some(Command::Verify(args)) => cmd_verify(&config, args).await,
+        None => cmd_record(config).await,
+    }
+}
+
+/// Connect to ClickHouse and ensure the schema exists.
+async fn connect_storage(config: &Config) -> anyhow::Result<Arc<dyn Storage>> {
+    let storage: Arc<dyn Storage> = Arc::new(
+        ClickHouseStorage::connect(
+            &config.clickhouse_url,
+            &config.clickhouse_database,
+            &config.clickhouse_user,
+            &config.clickhouse_password,
+        )
+        .await?,
+    );
+    storage.ping().await?;
+    storage.init_schema().await?;
+    Ok(storage)
+}
+
+/// Resolve a session id from an explicit value, or fall back to the most
+/// recent session for a symbol.
+async fn resolve_session(
+    storage: &dyn Storage,
+    explicit: Option<&str>,
+    symbol: Option<&str>,
+) -> anyhow::Result<Uuid> {
+    if let Some(id) = explicit {
+        return Ok(Uuid::parse_str(id)?);
+    }
+    let sessions = storage.list_sessions(20).await?;
+    let wanted = symbol.unwrap_or("BTCUSDT");
+    let session = sessions
+        .iter()
+        .find(|s| s.symbol == wanted)
+        .or_else(|| sessions.first())
+        .ok_or_else(|| anyhow::anyhow!("no sessions found"))?;
+    info!(
+        "Using most recent session for symbol '{}': {}",
+        wanted, session.session_id
+    );
+    Ok(session.session_id)
+}
+
+async fn cmd_replay(config: &Config, args: &ReplayArgs) -> anyhow::Result<()> {
+    let storage = connect_storage(config).await?;
+    let session_id = resolve_session(
+        storage.as_ref(),
+        args.session.as_deref(),
+        args.symbol.as_deref(),
+    )
+    .await?;
+    let session = storage
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
+
+    info!(
+        "Replaying session {} ({} events expected) — speed {}x",
+        session_id, session.depth_stream, args.speed
+    );
+
+    let data = load_session(storage.as_ref(), session_id).await?;
+    let config = ReplayConfig {
+        speed: args.speed,
+        seq_start: None,
+        seq_end: None,
+    };
+    let outcome = run_replay(data, config).await?;
+    println!("{}", ReplayReport { session, outcome });
+    Ok(())
+}
+
+async fn cmd_verify(config: &Config, args: &VerifyArgs) -> anyhow::Result<()> {
+    let storage = connect_storage(config).await?;
+    let session_id = resolve_session(storage.as_ref(), args.session.as_deref(), None).await?;
+    let report = verify_session(storage.as_ref(), session_id).await?;
+    println!("{}", report);
+    Ok(())
+}
+
+// ============================================================================
+// Record mode
+// ============================================================================
+
+async fn cmd_record(config: Config) -> anyhow::Result<()> {
     let start_time = Instant::now();
 
     info!("========================================");
@@ -39,6 +137,13 @@ async fn main() -> anyhow::Result<()> {
     info!("WebSocket base: {}", config.ws_base);
     info!("Depth stream: {}", config.depth_stream_url());
     info!("Trade stream: {}", config.trade_stream_url());
+    info!("Record mode: {}", if config.record { "ON" } else { "OFF" });
+    if config.record {
+        info!(
+            "Recording to ClickHouse: {} db={}",
+            config.clickhouse_url, config.clickhouse_database
+        );
+    }
     info!("========================================");
 
     // Create shared state
@@ -47,7 +152,6 @@ async fn main() -> anyhow::Result<()> {
     let trade_proc = Arc::new(RwLock::new(TradeProcessor::new()));
     let trade_connected = Arc::new(RwLock::new(false));
 
-    // Set initial state to Connecting
     {
         let mut s = sync.write().await;
         s.on_connecting();
@@ -73,6 +177,43 @@ async fn main() -> anyhow::Result<()> {
             error!("Trade WebSocket client fatal error: {}", e);
         }
     });
+
+    // Recording setup: storage, session row, recorder + storage worker.
+    let mut recorder: Option<Arc<futures_orderbook::recording::Recorder>> = None;
+    let mut recorder_handle = None;
+    let mut recording_storage: Option<Arc<dyn Storage>> = None;
+
+    if config.record {
+        let storage = connect_storage(&config).await?;
+        let session = SessionRecord::new(
+            &config.symbol,
+            "Binance",
+            "USDⓈ-M",
+            "PERPETUAL",
+            &config.depth_stream_url(),
+            &config.trade_stream_url(),
+            env!("CARGO_PKG_VERSION"),
+            &detect_git_commit(),
+        );
+        storage.insert_session(&session).await?;
+        storage
+            .update_session_status(session.session_id, SessionStatus::Recording.as_str(), None)
+            .await?;
+
+        let rconfig = RecordingConfig::new(
+            config.batch_size,
+            config.flush_interval_ms,
+            config.queue_capacity,
+        );
+        let (rec, handle) = start_recorder(Arc::clone(&storage), session, rconfig);
+        recorder = Some(rec);
+        recorder_handle = Some(handle);
+        recording_storage = Some(storage);
+        info!(
+            "Recording session started: {}",
+            recorder.as_ref().unwrap().session_id()
+        );
+    }
 
     // Main engine loop
     let mut diagnostic_interval =
@@ -115,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
                         let sync_clone = Arc::clone(&sync);
                         let evt_tx = event_tx.clone();
                         let symbol = config.symbol.clone();
+                        let recorder = recorder.clone();
                         tokio::spawn(async move {
                             const MAX_SNAPSHOT_RETRIES: u32 = 5;
                             for attempt in 1..=MAX_SNAPSHOT_RETRIES {
@@ -153,6 +295,17 @@ async fn main() -> anyhow::Result<()> {
                                             return;
                                         }
                                         drop(b);
+
+                                        if let Some(rec) = &recorder {
+                                            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                                            rec.record_snapshot(
+                                                &symbol,
+                                                snapshot.last_update_id,
+                                                now_ms,
+                                                &snapshot.bids,
+                                                &snapshot.asks,
+                                            );
+                                        }
 
                                         let mut s = sync_clone.write().await;
                                         info!(">>> SYNCHRONIZING — reconciling buffered events");
@@ -215,7 +368,19 @@ async fn main() -> anyhow::Result<()> {
                             reconnect_count: s.reconnect_count(),
                         });
                     }
-                    Some(WsMessage::DepthUpdate(update)) => {
+                    Some(WsMessage::DepthUpdate { update, raw, local_receive_time_ns }) => {
+                        if let Some(rec) = &recorder {
+                            rec.record_raw(
+                                &config.symbol,
+                                "depth",
+                                raw,
+                                update.event_time,
+                                Some(update.transaction_time),
+                                local_receive_time_ns,
+                            );
+                            rec.record_depth_event(&update, local_receive_time_ns);
+                        }
+
                         let mut s = sync.write().await;
 
                         match s.state() {
@@ -277,6 +442,7 @@ async fn main() -> anyhow::Result<()> {
                                         let sync_clone = Arc::clone(&sync);
                                         let evt_tx = event_tx.clone();
                                         let symbol = config.symbol.clone();
+                                        let recorder = recorder.clone();
                                         tokio::spawn(async move {
                                             const MAX_RESYNC_RETRIES: u32 = 5;
                                             for attempt in 1..=MAX_RESYNC_RETRIES {
@@ -312,6 +478,18 @@ async fn main() -> anyhow::Result<()> {
                                                             return;
                                                         }
                                                         drop(b);
+
+                                                        if let Some(rec) = &recorder {
+                                                            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                                                            rec.record_snapshot(
+                                                                &symbol,
+                                                                snapshot.last_update_id,
+                                                                now_ms,
+                                                                &snapshot.bids,
+                                                                &snapshot.asks,
+                                                            );
+                                                        }
+
                                                         let mut s = sync_clone.write().await;
                                                         match s.reconcile(snapshot.last_update_id) {
                                                             Ok(events) => {
@@ -390,13 +568,39 @@ async fn main() -> anyhow::Result<()> {
                         let mut tp = trade_proc.write().await;
                         tp.on_trade_reconnect();
                     }
-                    Some(TradeWsMessage::Trade(raw)) => {
-                        match normalize_trade(&raw) {
+                    Some(TradeWsMessage::Trade { trade, raw, local_receive_time_ns }) => {
+                        if let Some(rec) = &recorder {
+                            rec.record_raw(
+                                &config.symbol,
+                                "trade",
+                                raw,
+                                trade.event_time,
+                                None,
+                                local_receive_time_ns,
+                            );
+                        }
+
+                        match normalize_trade(&trade) {
                             NormalizeResult::Ok(event) => {
                                 let mut tp = trade_proc.write().await;
                                 use futures_orderbook::trades::processor::TradeProcessResult;
                                 match tp.process(event.clone()) {
                                     TradeProcessResult::Processed => {
+                                        if let Some(rec) = &recorder {
+                                            rec.record_trade(NewTrade {
+                                                symbol: event.symbol.clone(),
+                                                trade_id: event.trade_id,
+                                                first_trade_id: None,
+                                                last_trade_id: None,
+                                                price: event.price_ticks,
+                                                quantity: event.quantity_ticks,
+                                                aggressor_side: event.aggressor.label().to_string(),
+                                                exchange_event_time_ms: event.event_time,
+                                                trade_time_ms: event.trade_time,
+                                                local_receive_time_ns,
+                                                order_type: event.order_type.clone(),
+                                            });
+                                        }
                                         let _ = event_tx.send(MarketEvent::Trade(event));
                                     }
                                     TradeProcessResult::Duplicate => {
@@ -414,12 +618,18 @@ async fn main() -> anyhow::Result<()> {
                                     "Rejected marker event: trade_id={}, price={}, qty={}, order_type={}",
                                     marker.trade_id, marker.price, marker.quantity, marker.order_type
                                 );
+                                if let Some(rec) = &recorder {
+                                    rec.record_marker_rejected();
+                                }
                                 let mut tp = trade_proc.write().await;
                                 tp.record_marker_rejected();
                                 drop(tp);
                             }
                             NormalizeResult::ParseError(e) => {
                                 warn!("Failed to normalize trade: {}", e);
+                                if let Some(rec) = &recorder {
+                                    rec.record_invalid_rejected();
+                                }
                                 let mut tp = trade_proc.write().await;
                                 tp.record_malformed();
                                 drop(tp);
@@ -441,7 +651,7 @@ async fn main() -> anyhow::Result<()> {
                 let b = book.read().await;
                 let tp = trade_proc.read().await;
                 let tc = *trade_connected.read().await;
-                let output = format_diagnostics(
+                let mut output = format_diagnostics(
                     &config.symbol,
                     s.state(),
                     &b,
@@ -450,6 +660,12 @@ async fn main() -> anyhow::Result<()> {
                     tc,
                     start_time,
                 );
+                if let Some(rec) = &recorder {
+                    let metrics = rec.metrics.lock().unwrap().clone();
+                    let health = rec.health.lock().unwrap().clone();
+                    output.push('\n');
+                    output.push_str(&format_storage_section(&metrics, &health, rec.session_id()));
+                }
                 print!("\x1B[2J\x1B[H{}", output);
                 use std::io::Write;
                 std::io::stdout().flush().unwrap_or(());
@@ -468,7 +684,47 @@ async fn main() -> anyhow::Result<()> {
 
     ws_handle.abort();
     trade_ws_handle.abort();
-    info!("Engine shutdown complete");
 
+    // Stop recording: final flush, then persist the final session status.
+    if let Some(rec) = &recorder {
+        info!(
+            "Stopping recording (session {}), final flush...",
+            rec.session_id()
+        );
+        if let Some(storage) = &recording_storage {
+            storage
+                .update_session_status(
+                    rec.session_id(),
+                    SessionStatus::Stopping.as_str(),
+                    Some(Utc::now()),
+                )
+                .await?;
+        }
+        rec.request_shutdown();
+        if let Some(handle) = recorder_handle.take() {
+            handle.join().await?;
+        }
+        let degraded = {
+            let health = rec.health.lock().unwrap();
+            health.degraded || health.insert_failures > 0
+        };
+        let final_status = if degraded {
+            SessionStatus::Degraded
+        } else {
+            SessionStatus::Completed
+        };
+        if let Some(storage) = &recording_storage {
+            storage
+                .update_session_status(rec.session_id(), final_status.as_str(), Some(Utc::now()))
+                .await?;
+        }
+        info!(
+            "Recording finished: session {} -> {}",
+            rec.session_id(),
+            final_status
+        );
+    }
+
+    info!("Engine shutdown complete");
     Ok(())
 }

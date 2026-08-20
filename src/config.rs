@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 /// Configuration for the futures order-book engine.
 #[derive(Debug, Clone, Parser)]
@@ -42,6 +42,89 @@ pub struct Config {
     /// Run duration in seconds (0 = run indefinitely)
     #[arg(long, default_value_t = 0)]
     pub duration: u64,
+
+    /// Enable market-data recording to ClickHouse.
+    #[arg(long)]
+    pub record: bool,
+
+    /// ClickHouse HTTP URL.
+    #[arg(long, env = "CLICKHOUSE_URL", default_value = "http://localhost:8123")]
+    pub clickhouse_url: String,
+
+    /// ClickHouse database name.
+    #[arg(long, env = "CLICKHOUSE_DATABASE", default_value = "market_data")]
+    pub clickhouse_database: String,
+
+    /// ClickHouse user (empty = default).
+    #[arg(long, env = "CLICKHOUSE_USER", default_value = "")]
+    pub clickhouse_user: String,
+
+    /// ClickHouse password (empty = none).
+    #[arg(long, env = "CLICKHOUSE_PASSWORD", default_value = "")]
+    pub clickhouse_password: String,
+
+    /// Storage worker batch size (rows per type per flush).
+    #[arg(long, env = "RECORDING_BATCH_SIZE", default_value_t = 1000)]
+    pub batch_size: usize,
+
+    /// Storage worker flush interval in milliseconds.
+    #[arg(long, env = "RECORDING_FLUSH_INTERVAL", default_value_t = 250)]
+    pub flush_interval_ms: u64,
+
+    /// Storage queue capacity (bounded channel size).
+    #[arg(long, env = "RECORDING_QUEUE_CAPACITY", default_value_t = 100_000)]
+    pub queue_capacity: usize,
+
+    /// Subcommand: replay or verify.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Replay a recorded session (or symbol/time range) through the same
+    /// processing pipeline used by live ingestion. Read-only.
+    Replay(ReplayArgs),
+    /// Verify the integrity of a recorded session.
+    Verify(VerifyArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ReplayArgs {
+    /// Session ID to replay.
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Symbol for time-range replay.
+    #[arg(long)]
+    pub symbol: Option<String>,
+
+    /// Start time (RFC3339, UTC) for time-range replay.
+    #[arg(long)]
+    pub start: Option<String>,
+
+    /// End time (RFC3339, UTC) for time-range replay.
+    #[arg(long)]
+    pub end: Option<String>,
+
+    /// Replay speed: 1 = real-time, 10 = 10x, 0 = maximum speed.
+    #[arg(long, default_value_t = 0.0)]
+    pub speed: f64,
+
+    /// Print diagnostics during replay.
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct VerifyArgs {
+    /// Session ID to verify. If omitted, verify the most recent session.
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Also verify raw event counts against normalized counts.
+    #[arg(long, default_value_t = false)]
+    pub raw: bool,
 }
 
 impl Config {
@@ -91,6 +174,15 @@ impl Default for Config {
             reconnect_max_ms: 30_000,
             diagnostic_interval: 2,
             duration: 0,
+            record: false,
+            clickhouse_url: "http://localhost:8123".to_string(),
+            clickhouse_database: "market_data".to_string(),
+            clickhouse_user: String::new(),
+            clickhouse_password: String::new(),
+            batch_size: 1000,
+            flush_interval_ms: 250,
+            queue_capacity: 100_000,
+            command: None,
         }
     }
 }

@@ -163,6 +163,101 @@ Trade events do NOT modify the order book. Order-book events do NOT modify trade
 
 ---
 
+## Phase 3 — Market-Data Recording, Replay & Verification
+
+Phase 3 persists every raw Binance WebSocket payload **byte-for-byte** plus normalized rows into
+ClickHouse, then can replay any recorded session back through the **same** Phase 1/2
+Synchronizer / OrderBook / TradeProcessor pipeline for exact reconstruction, and audit a
+session for data-quality issues.
+
+```
+                Binance USDⓈ-M Futures
+                       │
+          depth@100ms  │  trade
+                       ▼
+              Recording Recorder ──▶ bounded mpsc queue ──▶ Storage Worker
+                       │  (raw + normalized)                   │ batch insert + retry
+                       ▼                                        ▼
+          OrderBook / TradeProcessor                       ClickHouse
+                       │
+                       ▼
+                   Replay/Verify
+```
+
+### Architecture
+
+- **Recorder** (`src/recording/`): async worker with a bounded queue (`try_send`,
+  backpressure) that batches inserts. Full queue → DEGRADED status + loud drop diagnostics.
+  Failed batches are **retained and retried** with backoff — never discarded. On shutdown the
+  worker drains everything and only then marks the session `COMPLETED`.
+- **Storage** (`src/storage/`): `Storage` trait with an in-memory backend (`MemoryStorage`,
+  used by offline tests) and a ClickHouse backend. Migrations live in `migrations/`.
+- **Replay** (`src/replay/`): reads raw events back, reconstructs `DepthUpdate`s, and feeds
+  them through the identical live-processing code at configurable speed.
+- **Verify** (`src/verify/`): audits a session — raw JSON parseability, duplicate trade IDs,
+  duplicate depth identities, marker (`marker`) rows mistaken for trades, invalid symbol rows,
+  and depth sequence anomalies.
+
+### ClickHouse (docker)
+
+```bash
+docker compose up -d
+```
+
+Migrations (tables, `ReplacingMergeTree` for idempotent retries) are applied automatically on
+first connect.
+
+### Record a Live Session
+
+```bash
+cargo run --release -- --symbol BTCUSDT --duration 60 --record
+```
+
+### Replay a Session
+
+```bash
+cargo run --release -- replay --session <SESSION_ID> --speed 10
+# or latest recorded session for the symbol:
+cargo run --release -- replay --speed 10
+```
+
+`--speed` sets pacing: `1` = real-time, `10` = 10×, `0` = as fast as possible. Replay is
+read-only and never writes storage.
+
+### Verify a Session
+
+```bash
+cargo run --release -- verify --session <SESSION_ID>
+cargo run --release -- verify          # latest session
+```
+
+### Storage Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLICKHOUSE_URL` | `http://localhost:8123` | ClickHouse HTTP endpoint |
+| `CLICKHOUSE_DATABASE` | `market_data` | Database name |
+| `CLICKHOUSE_USER` | *(empty)* | User (empty = default) |
+| `CLICKHOUSE_PASSWORD` | *(empty)* | Password |
+| `RECORDING_BATCH_SIZE` | `1000` | Rows per insert batch |
+| `RECORDING_FLUSH_INTERVAL` | `250` | Max ms between flushes |
+| `RECORDING_QUEUE_CAPACITY` | `100000` | Bounded recorder queue |
+
+### Schema (ClickHouse)
+
+| Table | Purpose | Engine |
+|-------|---------|--------|
+| `sessions` | Session metadata + status lifecycle | `MergeTree` |
+| `raw_events` | Byte-for-byte WS payloads (+ receive-time ns) | `MergeTree` |
+| `trades` | Normalized executed trades | `ReplacingMergeTree` |
+| `order_book_updates` | Normalized depth level changes | `ReplacingMergeTree` |
+| `snapshots` | REST depth snapshots at sync points | `MergeTree` |
+
+All prices/quantities are `UInt64` integer ticks scaled by 1e8. Trade/update IDs are `UInt64`,
+exchange times `UInt64` ms, and `local_receive_time_ns` is `UInt128`.
+
+---
+
 ## Running
 
 ### Prerequisites
@@ -199,6 +294,9 @@ RUST_LOG=debug cargo run --release -- --symbol BTCUSDT --duration 60
 | `--diagnostic-interval` | 2 | Diagnostic print interval (seconds) |
 | `--reconnect-base-ms` | 1000 | Reconnect base delay |
 | `--reconnect-max-ms` | 30000 | Reconnect max delay |
+| `--record` | off | Persist session to ClickHouse |
+| `replay` | – | Replay a recorded session (`--session`, `--speed`) |
+| `verify` | – | Audit a recorded session (`--session`) |
 
 ---
 
@@ -286,6 +384,27 @@ src/
 │   ├── rest.rs                # REST client (/fapi/v1/depth)
 │   ├── websocket.rs           # Depth WebSocket client
 │   └── ws_trades.rs           # Trade WebSocket client
+├── recording/
+│   ├── mod.rs                 # Recorder + worker wiring
+│   ├── recorder.rs            # Async recorder with bounded queue
+│   ├── worker.rs              # Batch drain + retry/flush worker
+│   ├── config.rs              # RecordingConfig
+│   ├── metrics.rs / health.rs # Diagnostics counters + DEGRADED state
+│   ├── session.rs / state.rs  # SessionRecord + SessionStatus
+│   └── record.rs              # Record row types
+├── storage/
+│   ├── mod.rs                 # Storage trait + shared row types
+│   ├── memory.rs              # In-memory backend (tests) + FlakyStorage
+│   ├── ch.rs                  # ClickHouse backend
+│   └── migrations.rs          # Schema migration runner
+├── replay/
+│   ├── mod.rs
+│   ├── reader.rs              # SessionData + event reconstruction
+│   ├── timing.rs              # Speed pacing
+│   ├── engine.rs              # run_replay (same pipeline as live)
+│   └── report.rs              # ReplayReport display
+├── verify/
+│   └── mod.rs                 # verify_session audit
 ├── orderbook/
 │   ├── mod.rs
 │   ├── book.rs                # Core OrderBook (BTreeMap)
@@ -308,10 +427,11 @@ src/
 ## Known Limitations
 
 - Phase 2 only implements the `btcusdt@trade` stream. The `@aggTrade` stream name does not exist on Binance Futures (it is Spot-only).
-- No database, frontend, or trading functionality.
+- No frontend or trading functionality.
 - No CVD, delta, absorption, or sweep analytics (deferred to later phases).
 - Price display uses 2 decimal places — very small tick values may display as 0.00 in diagnostics.
 - The 4096-entry duplicate window may miss duplicates that arrive after the window has evicted the original trade ID.
+- Recording requires ClickHouse; `--record` without a reachable server marks the session `DEGRADED`.
 
 ---
 

@@ -83,7 +83,6 @@ pub fn normalize_trade(trade: &FuturesTrade) -> NormalizeResult {
 mod tests {
     use super::*;
     use crate::binance::trade_types::FuturesTrade;
-    use crate::orderbook::level::TICK_SCALE;
 
     fn make_trade(trade_id: u64, price: &str, qty: &str, is_buyer_maker: bool) -> FuturesTrade {
         FuturesTrade {

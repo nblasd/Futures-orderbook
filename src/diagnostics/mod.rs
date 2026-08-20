@@ -185,3 +185,57 @@ pub fn format_diagnostics(
 
     output
 }
+
+/// Format the recording/storage section for diagnostics.
+pub fn format_storage_section(
+    metrics: &crate::recording::metrics::RecorderMetrics,
+    health: &crate::recording::metrics::StorageHealth,
+    session_id: uuid::Uuid,
+) -> String {
+    let mut out = String::new();
+    out.push_str("Storage\n");
+    out.push_str(&format!("Session: {}\n", session_id));
+    out.push_str(&format!("Status: {}\n", health.state.label()));
+    if let Some(err) = &health.last_error {
+        out.push_str(&format!("Last error: {}\n", err));
+    }
+    out.push_str(&format!(
+        "Queue depth: {}/{}\n",
+        metrics.queue_depth, metrics.queue_capacity
+    ));
+    out.push_str(&format!(
+        "Raw received/stored: {}/{} ({} bytes)\n",
+        metrics.raw_received, metrics.raw_stored, metrics.raw_bytes_stored
+    ));
+    out.push_str(&format!(
+        "Trades received/stored: {}/{}\n",
+        metrics.trades_received, metrics.trades_stored
+    ));
+    out.push_str(&format!(
+        "Depth events received/stored: {}/{}\n",
+        metrics.depth_events_received, metrics.level_changes_stored
+    ));
+    out.push_str(&format!("Snapshots stored: {}\n", metrics.snapshots_stored));
+    out.push_str(&format!(
+        "Marker/invalid rejected: {}/{}\n",
+        metrics.marker_rejected, metrics.invalid_rejected
+    ));
+    if metrics.raw_dropped + metrics.trades_dropped + metrics.depth_dropped > 0 {
+        out.push_str(&format!(
+            "DROPPED: raw={} trades={} depth={} (queue full)\n",
+            metrics.raw_dropped, metrics.trades_dropped, metrics.depth_dropped
+        ));
+    }
+    out.push_str(&format!(
+        "Flushes: {} (avg {:.1}ms, max {:.1}ms)\n",
+        metrics.flush_ops,
+        metrics.avg_flush_duration_ns() as f64 / 1e6,
+        metrics.max_flush_duration_ns as f64 / 1e6
+    ));
+    out.push_str(&format!(
+        "Insert failures / failed batches: {}/{}\n",
+        health.insert_failures, metrics.failed_batches
+    ));
+    out.push_str(&format!("Queue overflows: {}\n", health.queue_overflows));
+    out
+}

@@ -18,8 +18,13 @@ const MAX_RAW_LOG_PER_SECOND: usize = 5;
 /// Messages sent from the trade WebSocket client to the main engine.
 #[derive(Debug)]
 pub enum TradeWsMessage {
-    /// A parsed trade event.
-    Trade(FuturesTrade),
+    /// A parsed trade event, with the raw payload byte-for-byte and the
+    /// local receive time (ns since Unix epoch).
+    Trade {
+        trade: FuturesTrade,
+        raw: String,
+        local_receive_time_ns: u128,
+    },
     /// The WebSocket connection has been established.
     Connected,
     /// The WebSocket connection has been closed.
@@ -135,7 +140,12 @@ impl TradeWebSocketClient {
                                             trade.quantity,
                                             trade.is_buyer_maker
                                         );
-                                        let _ = tx.send(TradeWsMessage::Trade(trade));
+                                        let local_receive_time_ns = super::now_unix_nanos();
+                                        let _ = tx.send(TradeWsMessage::Trade {
+                                            trade,
+                                            raw: text.to_string(),
+                                            local_receive_time_ns,
+                                        });
                                     }
                                     Err(e) => {
                                         warn!(

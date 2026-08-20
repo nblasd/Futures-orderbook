@@ -15,8 +15,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 chrono = "0.4"
+clickhouse = { version = "0.15.1", features = ["uuid", "chrono"] }
+uuid = { version = "1.24.1", features = ["v4", "serde"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
