@@ -258,6 +258,102 @@ exchange times `UInt64` ms, and `local_receive_time_ns` is `UInt128`.
 
 ---
 
+## Phase 4 — Market-Microstructure Analytics
+
+Deterministic, rule-based microstructure analytics computed over the same `MarketEvent` stream in
+live and replay mode. All computations use exact `u64` integer ticks (`1e8` scale); floating point
+is used only for display and confidence scoring.
+
+### Signals
+
+| Signal | Definition |
+|--------|------------|
+| Delta | Aggressor buy volume − sell volume per price level / interval |
+| CVD | Cumulative session delta (running, not reset between snapshots) |
+| Volume-by-price | Buy/sell/`delta` volume aggregated per price |
+| Book imbalance | Top-`imbalance_depth` bid depth / (bid + ask) depth |
+| Microprice | Exact rational `(ask·bidQty + bid·askQty) / (bidQty + askQty)` |
+| Spread / depth | Best-bid/ask, spread in ticks, top-`depth` cumulative depth |
+| Liquidity events | Add/remove classified per level change |
+| Replenishment | Liquidity added back at a recently-depleted level within `replenishment_window_ms` |
+| Large trade | Single trade ≥ `large_trade_btc` |
+| Trade clusters | Trades grouped by time (`cluster_window_ms`) and price range (`cluster_price_range_ticks`) |
+| Sweep | A cluster of ≥ `sweep_min_levels` monotonic same-side levels with volume ≥ `sweep_min_volume_btc` |
+| Absorption | Aggressive flow that fails to move the passive-side best price beyond the excursion threshold |
+| Book anomalies | Crossed book / duplicate update id / out-of-sequence events |
+| Heatmap data model | `(cell_bucket_ms, price_bucket, side)` aggregation over `heatmap_cell_ms` cells |
+
+### Confidence Scoring (threshold `0.5`)
+
+- **Sweep** `= 0.35·level + 0.30·volume + 0.20·direction + 0.15·time`, where each factor is the
+  evidence ratio clamped to `[0, 1]` (e.g. `levels / min_levels`, `volume / min_volume`).
+- **Absorption** `= 0.30·aggressive_volume + 0.35·price_failure + 0.20·replenishment +
+  0.15·liquidity_persistence`, where `price_failure = 1 − min(1, displacement / excursion)`.
+
+Absorption additionally requires `absorption_min_trades` trades and `absorption_min_volume_btc`
+volume within `absorption_window_ms`, so a single large print never triggers it.
+
+### Determinism
+
+Snapshots are finalized on exchange timestamps only (trade time / `OrderBookUpdated.event_time_ms`),
+never on wall-clock. Every derived counter, digest, and event is identical whether the engine is fed
+from the live WebSocket pipeline or from a recorded session, making the live digest the oracle for
+replay verification.
+
+### Run
+
+```bash
+# Live, with analytics + recording
+cargo run --release -- --symbol BTCUSDT --duration 60 --record --analytics
+
+# Replay the same session with analytics (prints the digest)
+cargo run --release -- replay --speed 0 --analytics
+
+# Live only, no persistence
+cargo run --release -- --symbol BTCUSDT --duration 60 --analytics
+```
+
+The live digest is printed at shutdown; replay prints `digest.summarize()` after the `ReplayReport`.
+Compare the two — they must match for the session to be analytically consistent.
+
+### Persistence
+
+Enabled only when `--record` is also set. The analytics sink batches rows and flushes them on
+capacity or channel close (shutdown).
+
+| Table | Content |
+|-------|---------|
+| `analytics_snapshots` | Per-interval microstructure snapshot (book, flow, imbalance, liquidity) |
+| `analytics_events` | Derived events (large trade, sweep, absorption, replenishment, anomalies) |
+| `delta_by_price` | Session-cumulative delta per price, written at final flush |
+| `liquidity_events` | Per-change liquidity add/remove rows |
+
+`TradeDelta` and `Cluster` series are computed but not persisted by default.
+
+### Config
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--analytics` | off | Enable the analytics engine (live and replay) |
+| `--large-trade-btc` | `5.0` | Large-trade threshold in BTC |
+| `--sweep-window-ms` | `100` | Sweep cluster window |
+| `--sweep-min-levels` | `3` | Minimum distinct levels |
+| `--sweep-min-volume-btc` | `5.0` | Minimum cluster volume |
+| `--absorption-window-ms` | `1000` | Absorption window |
+| `--absorption-min-volume-btc` | `20.0` | Minimum aggressive volume |
+| `--absorption-min-trades` | `5` | Minimum aggressive trades |
+| `--absorption-max-price-excursion-ticks` | `3` | Max favorable displacement (tick-size units) |
+| `--replenishment-window-ms` | `250` | Replenishment window |
+| `--imbalance-depth-levels` | `10` | Levels scanned for depth/imbalance |
+| `--analytics-snapshot-interval-ms` | `1000` | Snapshot cadence |
+| `--analytics-retention-seconds` | `900` | In-memory retention window |
+| `--tick-size` | `0.10` | Tick size (must match the symbol) |
+| `--analytics-version` | `phase4-v1` | Algorithm version tag stored on rows |
+
+Thresholds expressed in BTC or ticks are converted to exact ticks via `(x · 1e8).round()`.
+
+---
+
 ## Running
 
 ### Prerequisites
@@ -295,8 +391,11 @@ RUST_LOG=debug cargo run --release -- --symbol BTCUSDT --duration 60
 | `--reconnect-base-ms` | 1000 | Reconnect base delay |
 | `--reconnect-max-ms` | 30000 | Reconnect max delay |
 | `--record` | off | Persist session to ClickHouse |
-| `replay` | – | Replay a recorded session (`--session`, `--speed`) |
+| `--analytics` | off | Enable Phase 4 microstructure analytics (live and replay) |
+| `replay` | – | Replay a recorded session (`--session`, `--speed`, `--analytics`) |
 | `verify` | – | Audit a recorded session (`--session`) |
+
+Analytics thresholds are configurable — see the Phase 4 table above.
 
 ---
 
@@ -396,6 +495,7 @@ src/
 │   ├── mod.rs                 # Storage trait + shared row types
 │   ├── memory.rs              # In-memory backend (tests) + FlakyStorage
 │   ├── ch.rs                  # ClickHouse backend
+│   ├── analytics.rs           # Analytics rows + batched sink worker
 │   └── migrations.rs          # Schema migration runner
 ├── replay/
 │   ├── mod.rs
@@ -418,6 +518,20 @@ src/
 ├── events/
 │   ├── mod.rs
 │   └── market.rs              # MarketEvent enum
+├── analytics/                 # Phase 4 microstructure engine (deterministic)
+│   ├── mod.rs
+│   ├── config.rs              # AnalyticsConfig (thresholds, version)
+│   ├── book.rs                # ShadowBook + Microprice (exact rational)
+│   ├── flow.rs                # Delta, CVD, volume-by-price
+│   ├── liquidity.rs           # Level-change classification + replenishment
+│   ├── large_trades.rs        # Large-trade detector
+│   ├── clusters.rs            # Trade cluster tracker
+│   ├── sweeps.rs              # Sweep detector (confidence-scored)
+│   ├── absorption.rs          # Absorption detector (confidence-scored)
+│   ├── heatmap.rs             # Heatmap data model
+│   ├── snapshot.rs            # MarketMicrostructureSnapshot + digest
+│   ├── events.rs              # AnalyticsEvent kinds
+│   └── engine.rs              # AnalyticsEngine (MarketEvent in → events out)
 └── diagnostics/
     └── mod.rs                 # CLI display + metrics
 ```
@@ -428,10 +542,12 @@ src/
 
 - Phase 2 only implements the `btcusdt@trade` stream. The `@aggTrade` stream name does not exist on Binance Futures (it is Spot-only).
 - No frontend or trading functionality.
-- No CVD, delta, absorption, or sweep analytics (deferred to later phases).
+- Sweep/absorption events are *candidates* — confidence-scored heuristics, not confirmed iceberg/spoof activity. A sweep may be a genuine market participant; absorption may be one-sided aggressive flow rather than deliberate iceberg absorption.
 - Price display uses 2 decimal places — very small tick values may display as 0.00 in diagnostics.
 - The 4096-entry duplicate window may miss duplicates that arrive after the window has evicted the original trade ID.
 - Recording requires ClickHouse; `--record` without a reachable server marks the session `DEGRADED`.
+- Analytics persistence requires `--record`; running `--analytics` alone computes the digest in memory only.
+- The `OrderBookUpdated` wire feed never carries previous quantities, so liquidity add/remove classification treats every change as an absolute-size replacement.
 
 ---
 

@@ -296,7 +296,10 @@ impl Recorder {
     fn send(&self, record: Record) -> bool {
         match self.tx.try_send(record) {
             Ok(()) => {
-                let depth = self.queue_len.fetch_add(1, Ordering::SeqCst) + 1;
+                let depth = self
+                    .queue_len
+                    .fetch_add(1, Ordering::SeqCst)
+                    .saturating_add(1);
                 let mut m = self.metrics.lock().unwrap();
                 if depth > m.queue_high_water {
                     m.queue_high_water = depth;

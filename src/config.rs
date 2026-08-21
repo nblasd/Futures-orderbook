@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
+use crate::analytics::config::{AnalyticsConfig, DEFAULT_ANALYTICS_VERSION};
+
 /// Configuration for the futures order-book engine.
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -75,6 +77,69 @@ pub struct Config {
     #[arg(long, env = "RECORDING_QUEUE_CAPACITY", default_value_t = 100_000)]
     pub queue_capacity: usize,
 
+    // ------------------------------------------------------------------
+    // Phase 4 analytics
+    // ------------------------------------------------------------------
+    /// Enable Phase 4 market-microstructure analytics (live and replay).
+    #[arg(long)]
+    pub analytics: bool,
+
+    /// Absolute quantity threshold (BTC) for large-trade detection.
+    #[arg(long, default_value_t = 5.0)]
+    pub large_trade_btc: f64,
+
+    /// Sweep detection window (ms).
+    #[arg(long, default_value_t = 100)]
+    pub sweep_window_ms: u64,
+
+    /// Minimum distinct price levels for a sweep candidate.
+    #[arg(long, default_value_t = 3)]
+    pub sweep_min_levels: u32,
+
+    /// Minimum aggregate volume (BTC) for a sweep candidate.
+    #[arg(long, default_value_t = 5.0)]
+    pub sweep_min_volume_btc: f64,
+
+    /// Absorption detection window (ms).
+    #[arg(long, default_value_t = 1000)]
+    pub absorption_window_ms: u64,
+
+    /// Minimum aggressive volume (BTC) for an absorption candidate.
+    #[arg(long, default_value_t = 20.0)]
+    pub absorption_min_volume_btc: f64,
+
+    /// Minimum number of aggressive trades for an absorption candidate.
+    #[arg(long, default_value_t = 5)]
+    pub absorption_min_trades: u32,
+
+    /// Maximum favorable price excursion (ticks) tolerated for absorption.
+    #[arg(long, default_value_t = 3)]
+    pub absorption_max_price_excursion_ticks: u64,
+
+    /// Replenishment detection window (ms).
+    #[arg(long, default_value_t = 250)]
+    pub replenishment_window_ms: u64,
+
+    /// Number of best levels scanned for book imbalance/depth.
+    #[arg(long, default_value_t = 10)]
+    pub imbalance_depth_levels: u32,
+
+    /// Interval (ms) at which analytics snapshots are produced.
+    #[arg(long, default_value_t = 1000)]
+    pub analytics_snapshot_interval_ms: u64,
+
+    /// In-memory analytics retention window (seconds).
+    #[arg(long, default_value_t = 900)]
+    pub analytics_retention_seconds: u64,
+
+    /// Tick size for the symbol (e.g. "0.10" for BTCUSDT).
+    #[arg(long, default_value = "0.10")]
+    pub tick_size: String,
+
+    /// Analytics algorithm version tag.
+    #[arg(long, default_value = DEFAULT_ANALYTICS_VERSION)]
+    pub analytics_version: String,
+
     /// Subcommand: replay or verify.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -114,6 +179,11 @@ pub struct ReplayArgs {
     /// Print diagnostics during replay.
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
+
+    /// Enable Phase 4 analytics during replay (computes a digest and compares
+    /// it against the live digest for the same session, when available).
+    #[arg(long, default_value_t = false)]
+    pub analytics: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -160,6 +230,39 @@ impl Config {
     pub fn exchange_info_url(&self) -> String {
         format!("{}/fapi/v1/exchangeInfo", self.rest_base)
     }
+
+    /// Build the Phase 4 analytics configuration from the CLI arguments.
+    pub fn analytics_config(&self) -> AnalyticsConfig {
+        let default = AnalyticsConfig::btcusdt_default();
+        AnalyticsConfig {
+            analytics_version: self.analytics_version.clone(),
+            tick_size_ticks: crate::orderbook::level::price_str_to_ticks(&self.tick_size)
+                .unwrap_or(default.tick_size_ticks),
+            large_trade_min_quantity_ticks: crate::analytics::config::btc_to_ticks(
+                self.large_trade_btc,
+            ),
+            sweep_window_ms: self.sweep_window_ms,
+            sweep_min_levels: self.sweep_min_levels,
+            sweep_min_volume_ticks: crate::analytics::config::btc_to_ticks(
+                self.sweep_min_volume_btc,
+            ),
+            absorption_window_ms: self.absorption_window_ms,
+            absorption_min_volume_ticks: crate::analytics::config::btc_to_ticks(
+                self.absorption_min_volume_btc,
+            ),
+            absorption_min_trades: self.absorption_min_trades,
+            absorption_max_excursion_ticks: self.absorption_max_price_excursion_ticks,
+            replenishment_window_ms: self.replenishment_window_ms,
+            imbalance_depth: self.imbalance_depth_levels,
+            snapshot_interval_ms: self.analytics_snapshot_interval_ms,
+            aggregation_intervals_ms: default.aggregation_intervals_ms,
+            heatmap_cell_ms: default.heatmap_cell_ms,
+            retention_ms: self.analytics_retention_seconds * 1000,
+            cluster_window_ms: default.cluster_window_ms,
+            cluster_price_range_ticks: default.cluster_price_range_ticks,
+            confidence_threshold: default.confidence_threshold,
+        }
+    }
 }
 
 impl Default for Config {
@@ -182,6 +285,21 @@ impl Default for Config {
             batch_size: 1000,
             flush_interval_ms: 250,
             queue_capacity: 100_000,
+            analytics: false,
+            large_trade_btc: 5.0,
+            sweep_window_ms: 100,
+            sweep_min_levels: 3,
+            sweep_min_volume_btc: 5.0,
+            absorption_window_ms: 1000,
+            absorption_min_volume_btc: 20.0,
+            absorption_min_trades: 5,
+            absorption_max_price_excursion_ticks: 3,
+            replenishment_window_ms: 250,
+            imbalance_depth_levels: 10,
+            analytics_snapshot_interval_ms: 1000,
+            analytics_retention_seconds: 900,
+            tick_size: "0.10".to_string(),
+            analytics_version: DEFAULT_ANALYTICS_VERSION.to_string(),
             command: None,
         }
     }

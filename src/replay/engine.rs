@@ -5,6 +5,10 @@
 //! so the replayed book state matches the recorded one. Read-only; never
 //! touches the network.
 
+use crate::analytics::config::AnalyticsConfig;
+use crate::analytics::engine::AnalyticsEngine;
+use crate::analytics::snapshot::AnalyticsFlowDigest;
+use crate::events::market::MarketEvent;
 use crate::orderbook::book::OrderBook;
 use crate::orderbook::synchronizer::{ProcessResult, SyncState, Synchronizer};
 use crate::replay::reader::SessionData;
@@ -18,6 +22,9 @@ pub struct ReplayConfig {
     /// If set, only replay events with `seq` in `[start, end]`.
     pub seq_start: Option<u64>,
     pub seq_end: Option<u64>,
+    /// Enable the Phase 4 analytics engine during replay. When set, a
+    /// deterministic flow digest is computed and returned in the outcome.
+    pub analytics: Option<AnalyticsConfig>,
 }
 
 impl Default for ReplayConfig {
@@ -26,6 +33,7 @@ impl Default for ReplayConfig {
             speed: 0.0,
             seq_start: None,
             seq_end: None,
+            analytics: None,
         }
     }
 }
@@ -49,6 +57,8 @@ pub struct ReplayOutcome {
     pub mid_price: Option<f64>,
     pub spread: Option<u64>,
     pub duration_ns: u128,
+    /// Deterministic analytics flow digest (only when replay analytics enabled).
+    pub analytics_digest: Option<AnalyticsFlowDigest>,
 }
 
 /// Run a replay over the given session data.
@@ -56,6 +66,10 @@ pub async fn run_replay(data: SessionData, config: ReplayConfig) -> anyhow::Resu
     let mut sync = Synchronizer::new();
     let mut book = OrderBook::new();
     let mut trade_proc = TradeProcessor::new();
+    let mut analytics: Option<AnalyticsEngine> = config
+        .analytics
+        .as_ref()
+        .map(|cfg| AnalyticsEngine::new(cfg.clone()));
 
     // Mirror live: once the depth stream connects we begin buffering.
     sync.on_connected();
@@ -105,6 +119,19 @@ pub async fn run_replay(data: SessionData, config: ReplayConfig) -> anyhow::Resu
                         sync.trigger_resync();
                     }
                 }
+                // Seed the analytics shadow book exactly like live does (after
+                // reconcile application, so the state matches).
+                if let Some(engine) = analytics.as_mut() {
+                    let full = book.snapshot();
+                    let symbol = "BTCUSDT".to_string();
+                    let ev = MarketEvent::OrderBookSnapshot {
+                        symbol,
+                        update_id: *update_id,
+                        bids: full.bids.iter().map(|l| (l.price, l.quantity)).collect(),
+                        asks: full.asks.iter().map(|l| (l.price, l.quantity)).collect(),
+                    };
+                    engine.process_event(&ev);
+                }
             }
             crate::replay::reader::ReplayEvent::Depth { update, .. } => {
                 outcome.depth_events += 1;
@@ -123,6 +150,43 @@ pub async fn run_replay(data: SessionData, config: ReplayConfig) -> anyhow::Resu
                                 update.final_update_id,
                             )?;
                             outcome.events_applied += 1;
+                            if let Some(engine) = analytics.as_mut() {
+                                let ev = MarketEvent::OrderBookUpdated {
+                                    symbol: update.symbol.clone(),
+                                    update_id: update.final_update_id,
+                                    event_time_ms: update.event_time,
+                                    bid_changes: update
+                                        .bids
+                                        .iter()
+                                        .map(|(p, q)| {
+                                            let price_ticks =
+                                                crate::orderbook::level::price_str_to_ticks(p)
+                                                    .unwrap_or(0);
+                                            let qty_ticks =
+                                                crate::orderbook::level::quantity_str_to_ticks(q)
+                                                    .unwrap_or(0);
+                                            (price_ticks, qty_ticks, None)
+                                        })
+                                        .collect(),
+                                    ask_changes: update
+                                        .asks
+                                        .iter()
+                                        .map(|(p, q)| {
+                                            let price_ticks =
+                                                crate::orderbook::level::price_str_to_ticks(p)
+                                                    .unwrap_or(0);
+                                            let qty_ticks =
+                                                crate::orderbook::level::quantity_str_to_ticks(q)
+                                                    .unwrap_or(0);
+                                            (price_ticks, qty_ticks, None)
+                                        })
+                                        .collect(),
+                                    best_bid: book.best_bid(),
+                                    best_ask: book.best_ask(),
+                                    mid_price: book.mid_price(),
+                                };
+                                engine.process_event(&ev);
+                            }
                         }
                         ProcessResult::Stale | ProcessResult::Ignored => {
                             outcome.events_ignored += 1;
@@ -140,7 +204,12 @@ pub async fn run_replay(data: SessionData, config: ReplayConfig) -> anyhow::Resu
             }
             crate::replay::reader::ReplayEvent::Trade { event, .. } => {
                 match trade_proc.process(event.clone()) {
-                    TradeProcessResult::Processed => outcome.trades_processed += 1,
+                    TradeProcessResult::Processed => {
+                        outcome.trades_processed += 1;
+                        if let Some(engine) = analytics.as_mut() {
+                            engine.process_event(&MarketEvent::Trade(event.clone()));
+                        }
+                    }
                     _ => outcome.trades_skipped += 1,
                 }
             }
@@ -156,6 +225,10 @@ pub async fn run_replay(data: SessionData, config: ReplayConfig) -> anyhow::Resu
     outcome.best_ask = snap.best_ask;
     outcome.mid_price = snap.mid_price;
     outcome.spread = snap.best_bid.and_then(|b| snap.best_ask.map(|a| a - b));
+
+    if let Some(engine) = analytics.as_ref() {
+        outcome.analytics_digest = Some(engine.digest());
+    }
 
     Ok(outcome)
 }

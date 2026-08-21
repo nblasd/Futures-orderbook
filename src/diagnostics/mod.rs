@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use crate::analytics::engine::AnalyticsEngine;
 use crate::orderbook::{OrderBook, SyncState, Synchronizer};
 use crate::trades::processor::TradeProcessor;
 
@@ -184,6 +185,50 @@ pub fn format_diagnostics(
     output.push_str(&format!("Buffer size: {}\n", sync.buffer_size()));
 
     output
+}
+
+/// Format the Phase 4 analytics section for diagnostics.
+pub fn format_analytics_section(engine: &AnalyticsEngine) -> String {
+    let mut out = String::new();
+    out.push_str("Analytics\n");
+    out.push_str(&format!("Version: {}\n", engine.cfg.analytics_version));
+    out.push_str(&format!("Digest: {}\n", engine.digest().summarize()));
+    out.push_str(&format!(
+        "Shadow book: {} bids / {} asks ready={} crossed={}\n",
+        engine.book.bid_levels().count(),
+        engine.book.ask_levels().count(),
+        engine.book.is_ready(),
+        engine.book.is_crossed()
+    ));
+    if let Some(b) = engine.book.best_bid() {
+        out.push_str(&format!(
+            "Shadow best bid/ask: {}/{}\n",
+            crate::orderbook::level::ticks_to_price_str(b),
+            engine
+                .book
+                .best_ask()
+                .map(crate::orderbook::level::ticks_to_price_str)
+                .unwrap_or_else(|| "----".to_string())
+        ));
+    }
+    if let Some(imb) = engine.book.imbalance(engine.cfg.imbalance_depth) {
+        out.push_str(&format!("Imbalance: {:.3}\n", imb));
+    }
+    if let Some(mp) = engine.book.microprice() {
+        out.push_str(&format!(
+            "Microprice: {:.2}\n",
+            crate::analytics::book::Microprice::f64(&mp)
+        ));
+    }
+    out.push_str(&format!(
+        "Replenishments: {}\n",
+        engine.liquidity_tracker().replenishment_count
+    ));
+    out.push_str(&format!(
+        "Heatmap cells: {}\n",
+        engine.heatmap().cell_count()
+    ));
+    out
 }
 
 /// Format the recording/storage section for diagnostics.

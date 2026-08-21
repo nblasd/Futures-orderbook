@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod analytics;
 pub mod binance;
 pub mod config;
 pub mod diagnostics;

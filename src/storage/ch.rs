@@ -9,7 +9,10 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::migrations;
-use super::{LevelChangeRow, RawEventRow, SnapshotRow, Storage, TradeRow};
+use super::{
+    AnalyticsEventRow, AnalyticsSnapshotRow, DeltaByPriceRow, LevelChangeRow, LiquidityEventRow,
+    RawEventRow, SnapshotRow, Storage, TradeRow,
+};
 use crate::recording::session::SessionRecord;
 
 const SELECT_SESSION: &str = "SELECT session_id, exchange, market_type, symbol, contract_type, \
@@ -294,6 +297,93 @@ impl Storage for ClickHouseStorage {
         q = q.bind(&self.database);
         let row = q.fetch_one::<CountRow>().await?;
         Ok(row.n)
+    }
+
+    async fn insert_analytics_snapshots(
+        &self,
+        batch: &[AnalyticsSnapshotRow],
+    ) -> anyhow::Result<()> {
+        insert_batch(&self.client, "analytics_snapshots", batch).await
+    }
+
+    async fn insert_analytics_events(&self, batch: &[AnalyticsEventRow]) -> anyhow::Result<()> {
+        insert_batch(&self.client, "analytics_events", batch).await
+    }
+
+    async fn insert_delta_by_price(&self, batch: &[DeltaByPriceRow]) -> anyhow::Result<()> {
+        insert_batch(&self.client, "delta_by_price", batch).await
+    }
+
+    async fn insert_liquidity_events(&self, batch: &[LiquidityEventRow]) -> anyhow::Result<()> {
+        insert_batch(&self.client, "liquidity_events", batch).await
+    }
+
+    async fn read_analytics_snapshots(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<AnalyticsSnapshotRow>> {
+        let mut q = self.client.query(
+            "SELECT session_id, symbol, timestamp_ms, analytics_version, book_ready, best_bid, \
+             best_ask, mid_price, spread_ticks, microprice_num, microprice_den, trade_volume, \
+             buy_volume, sell_volume, delta, cvd, bid_depth, ask_depth, book_imbalance, \
+             liquidity_added, liquidity_removed, large_trade_count, sweep_candidate_count, \
+             absorption_candidate_count, replenishment_count, book_crossed, anomalies \
+             FROM analytics_snapshots WHERE session_id = ? ORDER BY timestamp_ms",
+        );
+        q = q.bind(session_id);
+        Ok(q.fetch_all().await?)
+    }
+
+    async fn read_analytics_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<AnalyticsEventRow>> {
+        let mut q = self.client.query(
+            "SELECT session_id, symbol, ts_ms, kind, side, price, quantity, detail \
+             FROM analytics_events WHERE session_id = ? ORDER BY ts_ms",
+        );
+        q = q.bind(session_id);
+        Ok(q.fetch_all().await?)
+    }
+
+    async fn read_delta_by_price(&self, session_id: Uuid) -> anyhow::Result<Vec<DeltaByPriceRow>> {
+        let mut q = self.client.query(
+            "SELECT session_id, symbol, ts_ms, price, buy_volume, sell_volume, total_volume, \
+             delta, trade_count, large_trade_count \
+             FROM delta_by_price WHERE session_id = ? ORDER BY price",
+        );
+        q = q.bind(session_id);
+        Ok(q.fetch_all().await?)
+    }
+
+    async fn read_liquidity_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<LiquidityEventRow>> {
+        let mut q = self.client.query(
+            "SELECT session_id, symbol, ts_ms, kind, side, price, quantity_delta, is_replenishment \
+             FROM liquidity_events WHERE session_id = ? ORDER BY ts_ms",
+        );
+        q = q.bind(session_id);
+        Ok(q.fetch_all().await?)
+    }
+
+    async fn count_analytics_snapshots(&self, session_id: Uuid) -> anyhow::Result<u64> {
+        count(
+            &self.client,
+            "SELECT count() AS n FROM analytics_snapshots WHERE session_id = ?",
+            session_id,
+        )
+        .await
+    }
+
+    async fn count_analytics_events(&self, session_id: Uuid) -> anyhow::Result<u64> {
+        count(
+            &self.client,
+            "SELECT count() AS n FROM analytics_events WHERE session_id = ?",
+            session_id,
+        )
+        .await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

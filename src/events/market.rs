@@ -13,6 +13,19 @@ pub enum MarketEvent {
         ask_levels: usize,
     },
 
+    /// A full order-book snapshot (initial synchronization or resync) with
+    /// the complete bid/ask level sets. Emitted *after* any reconciled
+    /// buffered events have been applied, so the full book state is exact.
+    /// This is what seeds the analytics shadow book (live and replay).
+    OrderBookSnapshot {
+        symbol: String,
+        update_id: u64,
+        /// Bids: (price_ticks, quantity_ticks), best first.
+        bids: Vec<(u64, u64)>,
+        /// Asks: (price_ticks, quantity_ticks), best first.
+        asks: Vec<(u64, u64)>,
+    },
+
     /// The order book has been updated with new depth data.
     /// Contains enough information for future phases to compute:
     /// - Liquidity changes at each level
@@ -24,6 +37,8 @@ pub enum MarketEvent {
     OrderBookUpdated {
         symbol: String,
         update_id: u64,
+        /// Exchange event time (ms) — deterministic for live and replay.
+        event_time_ms: u64,
         /// Bid changes: (price_ticks, new_quantity_ticks, old_quantity_ticks)
         bid_changes: Vec<(u64, u64, Option<u64>)>,
         /// Ask changes: (price_ticks, new_quantity_ticks, old_quantity_ticks)

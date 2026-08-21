@@ -5,10 +5,15 @@
 //! - [`memory::MemoryStorage`] — an in-process backend used by the offline
 //!   end-to-end tests (no network, no ClickHouse required).
 
+pub mod analytics;
 pub mod ch;
 pub mod memory;
 pub mod migrations;
 
+pub use analytics::{
+    start_analytics_sink, AnalyticsBatch, AnalyticsEventRow, AnalyticsSink, AnalyticsSinkHandle,
+    AnalyticsSnapshotRow, DeltaByPriceRow, LiquidityEventRow,
+};
 pub use ch::ClickHouseStorage;
 pub use memory::{FlakyStorage, MemoryStorage};
 
@@ -244,6 +249,52 @@ pub trait Storage: Send + Sync {
 
     /// Total on-disk size of the market-data database (bytes).
     async fn database_size(&self) -> anyhow::Result<u64>;
+
+    // ------------------------------------------------------------------
+    // Phase 4 analytics persistence
+    // ------------------------------------------------------------------
+
+    /// Batch-insert analytics snapshots.
+    async fn insert_analytics_snapshots(
+        &self,
+        batch: &[AnalyticsSnapshotRow],
+    ) -> anyhow::Result<()>;
+
+    /// Batch-insert derived analytics events.
+    async fn insert_analytics_events(&self, batch: &[AnalyticsEventRow]) -> anyhow::Result<()>;
+
+    /// Batch-insert session volume-at-price profile rows.
+    async fn insert_delta_by_price(&self, batch: &[DeltaByPriceRow]) -> anyhow::Result<()>;
+
+    /// Batch-insert liquidity level-change rows.
+    async fn insert_liquidity_events(&self, batch: &[LiquidityEventRow]) -> anyhow::Result<()>;
+
+    /// Read analytics snapshots for a session, ordered by timestamp.
+    async fn read_analytics_snapshots(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<AnalyticsSnapshotRow>>;
+
+    /// Read analytics events for a session, ordered by ts.
+    async fn read_analytics_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<AnalyticsEventRow>>;
+
+    /// Read the delta-by-price profile for a session.
+    async fn read_delta_by_price(&self, session_id: Uuid) -> anyhow::Result<Vec<DeltaByPriceRow>>;
+
+    /// Read liquidity events for a session, ordered by ts.
+    async fn read_liquidity_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<LiquidityEventRow>>;
+
+    /// Number of analytics snapshot rows for a session.
+    async fn count_analytics_snapshots(&self, session_id: Uuid) -> anyhow::Result<u64>;
+
+    /// Number of analytics event rows for a session.
+    async fn count_analytics_events(&self, session_id: Uuid) -> anyhow::Result<u64>;
 
     /// Downcast to the concrete type (for tests and diagnostics).
     fn as_any(&self) -> &dyn std::any::Any;

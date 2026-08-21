@@ -1,0 +1,31 @@
+CREATE TABLE IF NOT EXISTS analytics_snapshots (
+    session_id UUID,
+    symbol String,
+    timestamp_ms DateTime64(3, 'UTC'),
+    analytics_version String,
+    book_ready UInt8,
+    best_bid Nullable(UInt64),
+    best_ask Nullable(UInt64),
+    mid_price Nullable(Float64),
+    spread_ticks Nullable(UInt64),
+    microprice_num Nullable(UInt128),
+    microprice_den Nullable(UInt128),
+    trade_volume UInt64,
+    buy_volume UInt64,
+    sell_volume UInt64,
+    delta Int128,
+    cvd Int128,
+    bid_depth UInt64,
+    ask_depth UInt64,
+    book_imbalance Nullable(Float64),
+    liquidity_added UInt64,
+    liquidity_removed UInt64,
+    large_trade_count UInt64,
+    sweep_candidate_count UInt64,
+    absorption_candidate_count UInt64,
+    replenishment_count UInt64,
+    book_crossed UInt8,
+    anomalies UInt64
+)
+ENGINE = MergeTree
+ORDER BY (session_id, timestamp_ms)

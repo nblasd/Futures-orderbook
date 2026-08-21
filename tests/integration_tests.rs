@@ -7,7 +7,7 @@ use futures_orderbook::orderbook::synchronizer::{ProcessResult, SyncState, Synch
 // Helper functions
 // ============================================================================
 
-#[allow(non_snake_case, dead_code)]
+#[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
 fn make_depth_update(
     event_type: &str,
     event_time: u64,

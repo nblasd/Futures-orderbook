@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use futures_orderbook::analytics::engine::AnalyticsEngine;
 use futures_orderbook::binance::{
     RestClient, TradeWebSocketClient, TradeWsMessage, WebSocketClient, WsMessage,
 };
@@ -18,7 +19,10 @@ use futures_orderbook::recording::{
     detect_git_commit, start_recorder, NewTrade, RecordingConfig, SessionRecord, SessionStatus,
 };
 use futures_orderbook::replay::{load_session, run_replay, ReplayConfig, ReplayReport};
-use futures_orderbook::storage::{ClickHouseStorage, Storage};
+use futures_orderbook::storage::{
+    start_analytics_sink, AnalyticsBatch, AnalyticsEventRow, AnalyticsSink, AnalyticsSinkHandle,
+    AnalyticsSnapshotRow, ClickHouseStorage, DeltaByPriceRow, LiquidityEventRow, Storage,
+};
 use futures_orderbook::trades::normalizer::{normalize_trade, NormalizeResult};
 use futures_orderbook::trades::processor::TradeProcessor;
 use futures_orderbook::verify::verify_session;
@@ -59,6 +63,67 @@ async fn connect_storage(config: &Config) -> anyhow::Result<Arc<dyn Storage>> {
     storage.ping().await?;
     storage.init_schema().await?;
     Ok(storage)
+}
+
+/// Convert engine output into a persistence batch for a session.
+///
+/// `TradeDelta` and `Cluster` events are computed but not persisted by default
+/// (they are high-frequency and fully derivable from the raw trade stream).
+fn analytics_batch_from_output(
+    output: &futures_orderbook::analytics::engine::EngineOutput,
+    session_id: uuid::Uuid,
+) -> AnalyticsBatch {
+    let mut batch = AnalyticsBatch::default();
+    for s in &output.snapshots {
+        batch
+            .snapshots
+            .push(AnalyticsSnapshotRow::from_snapshot(s, session_id));
+    }
+    for e in &output.events {
+        if matches!(
+            e.kind,
+            futures_orderbook::analytics::events::AnalyticsEventKind::TradeDelta
+                | futures_orderbook::analytics::events::AnalyticsEventKind::Cluster
+        ) {
+            continue;
+        }
+        batch
+            .events
+            .push(AnalyticsEventRow::from_event(e, session_id));
+        // Liquidity-level changes are persisted separately as well.
+        if let Some(liq) = liquidity_row_from_event(e, session_id) {
+            batch.liquidity_events.push(liq);
+        }
+    }
+    batch
+}
+
+/// Build a `LiquidityEventRow` from an analytics event, when applicable.
+fn liquidity_row_from_event(
+    e: &futures_orderbook::analytics::events::AnalyticsEvent,
+    session_id: uuid::Uuid,
+) -> Option<LiquidityEventRow> {
+    use futures_orderbook::analytics::events::AnalyticsEventKind;
+    let kind = match e.kind {
+        AnalyticsEventKind::LiquidityAdded => "added",
+        AnalyticsEventKind::LiquidityRemoved => "removed",
+        AnalyticsEventKind::LiquidityIncreased => "increased",
+        AnalyticsEventKind::LiquidityDecreased => "decreased",
+        AnalyticsEventKind::LiquidityReplenishment => "replenishment",
+        _ => return None,
+    };
+    let side = e.side.clone().unwrap_or_default();
+    let price = e.price.unwrap_or(0);
+    Some(LiquidityEventRow {
+        session_id,
+        symbol: e.symbol.clone(),
+        ts_ms: futures_orderbook::storage::ms_to_datetime(e.ts_ms),
+        kind: kind.to_string(),
+        side,
+        price,
+        quantity_delta: e.quantity,
+        is_replenishment: e.kind == AnalyticsEventKind::LiquidityReplenishment,
+    })
 }
 
 /// Resolve a session id from an explicit value, or fall back to the most
@@ -108,9 +173,23 @@ async fn cmd_replay(config: &Config, args: &ReplayArgs) -> anyhow::Result<()> {
         speed: args.speed,
         seq_start: None,
         seq_end: None,
+        analytics: if args.analytics {
+            Some(config.analytics_config())
+        } else {
+            None
+        },
     };
     let outcome = run_replay(data, config).await?;
-    println!("{}", ReplayReport { session, outcome });
+    println!(
+        "{}",
+        ReplayReport {
+            session,
+            outcome: outcome.clone()
+        }
+    );
+    if let Some(digest) = &outcome.analytics_digest {
+        println!("Analytics digest: {}", digest.summarize());
+    }
     Ok(())
 }
 
@@ -214,6 +293,33 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
             recorder.as_ref().unwrap().session_id()
         );
     }
+
+    // Phase 4 analytics setup. The engine is synchronous and sits behind a
+    // std Mutex; it consumes the same MarketEvent stream the book does.
+    let analytics_engine: Option<std::sync::Mutex<AnalyticsEngine>> = if config.analytics {
+        Some(std::sync::Mutex::new(AnalyticsEngine::new(
+            config.analytics_config(),
+        )))
+    } else {
+        None
+    };
+    let mut analytics_sink_handle: Option<AnalyticsSinkHandle> = None;
+    let analytics_sink: Option<AnalyticsSink> = match (config.analytics, config.record) {
+        (true, true) => {
+            let storage = recording_storage
+                .clone()
+                .expect("storage exists when recording");
+            let (sink, handle) = start_analytics_sink(storage, config.queue_capacity);
+            analytics_sink_handle = Some(handle);
+            Some(sink)
+        }
+        _ => None,
+    };
+    let analytics_session_id = if config.record {
+        recorder.as_ref().unwrap().session_id()
+    } else {
+        uuid::Uuid::nil()
+    };
 
     // Main engine loop
     let mut diagnostic_interval =
@@ -329,6 +435,15 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
                                                 drop(b);
 
                                                 info!(">>> READY — order book synchronized");
+                                                // Seed the analytics shadow book with the full post-reconcile
+                                                // state, then announce readiness.
+                                                let full = book_clone.read().await.snapshot();
+                                                let _ = evt_tx.send(MarketEvent::OrderBookSnapshot {
+                                                    symbol: symbol.clone(),
+                                                    update_id: full.last_update_id,
+                                                    bids: full.bids.iter().map(|l| (l.price, l.quantity)).collect(),
+                                                    asks: full.asks.iter().map(|l| (l.price, l.quantity)).collect(),
+                                                });
                                                 let _ = evt_tx.send(MarketEvent::OrderBookSynchronized {
                                                     symbol,
                                                     last_update_id: snapshot.last_update_id,
@@ -412,6 +527,7 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
                                             let _ = event_tx.send(MarketEvent::OrderBookUpdated {
                                                 symbol: config.symbol.clone(),
                                                 update_id: update.final_update_id,
+                                                event_time_ms: update.event_time,
                                                 bid_changes: update.bids.iter().map(|(p, q)| {
                                                     let price_ticks = futures_orderbook::orderbook::level::price_str_to_ticks(p).unwrap_or(0);
                                                     let qty_ticks = futures_orderbook::orderbook::level::quantity_str_to_ticks(q).unwrap_or(0);
@@ -503,6 +619,13 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
                                                                 }
                                                                 drop(b);
                                                                 info!("RESYNC completed — READY");
+                                                                let full = book_clone.read().await.snapshot();
+                                                                let _ = evt_tx.send(MarketEvent::OrderBookSnapshot {
+                                                                    symbol: symbol.clone(),
+                                                                    update_id: full.last_update_id,
+                                                                    bids: full.bids.iter().map(|l| (l.price, l.quantity)).collect(),
+                                                                    asks: full.asks.iter().map(|l| (l.price, l.quantity)).collect(),
+                                                                });
                                                                 let _ = evt_tx.send(MarketEvent::OrderBookResyncCompleted {
                                                                     symbol,
                                                                     last_update_id: snapshot.last_update_id,
@@ -666,13 +789,37 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
                     output.push('\n');
                     output.push_str(&format_storage_section(&metrics, &health, rec.session_id()));
                 }
+                if let Some(engine) = &analytics_engine {
+                    let eng = engine.lock().unwrap();
+                    output.push('\n');
+                    output.push_str(&futures_orderbook::diagnostics::format_analytics_section(&eng));
+                }
                 print!("\x1B[2J\x1B[H{}", output);
                 use std::io::Write;
                 std::io::stdout().flush().unwrap_or(());
             }
 
-            // Drain internal events
-            _ = event_rx.recv() => {}
+            // Process internal events (analytics engine)
+            ev = event_rx.recv() => {
+                match ev {
+                    Some(ev) => {
+                        if let Some(engine) = &analytics_engine {
+                            let output = {
+                                let mut eng = engine.lock().unwrap();
+                                eng.process_event(&ev)
+                            };
+                            if let Some(sink) = &analytics_sink {
+                                let batch = analytics_batch_from_output(&output, analytics_session_id);
+                                sink.submit(batch);
+                            }
+                        }
+                    }
+                    None => {
+                        info!("Event channel closed");
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -684,6 +831,51 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
 
     ws_handle.abort();
     trade_ws_handle.abort();
+
+    // Finalize analytics: force a final snapshot and persist the session
+    // volume-at-price profile (delta_by_price). Runs for live and replay.
+    if let Some(engine) = &analytics_engine {
+        let (final_snapshot, delta_rows) = {
+            let mut eng = engine.lock().unwrap();
+            info!("Analytics digest (live): {}", eng.digest().summarize());
+            let snapshot = eng.force_snapshot();
+            let mut rows = Vec::new();
+            if let Some(ts) = eng.last_event_ts() {
+                for (price, v) in eng.flow().volume_by_price() {
+                    rows.push(DeltaByPriceRow {
+                        session_id: analytics_session_id,
+                        symbol: "BTCUSDT".to_string(),
+                        ts_ms: futures_orderbook::storage::ms_to_datetime(ts),
+                        price: *price,
+                        buy_volume: v.buy_volume,
+                        sell_volume: v.sell_volume,
+                        total_volume: v.total_volume,
+                        delta: v.delta,
+                        trade_count: v.trade_count,
+                        large_trade_count: v.large_trade_count,
+                    });
+                }
+            }
+            (snapshot, rows)
+        };
+        if let Some(sink) = &analytics_sink {
+            let mut batch = AnalyticsBatch::default();
+            if let Some(snap) = &final_snapshot {
+                batch.snapshots.push(AnalyticsSnapshotRow::from_snapshot(
+                    snap,
+                    analytics_session_id,
+                ));
+            }
+            batch.delta_by_price = delta_rows;
+            sink.submit(batch);
+        }
+    }
+    if let Some(handle) = analytics_sink_handle.take() {
+        // Drop the sender first so the worker observes the channel close and
+        // performs its final flush; otherwise the join would block forever.
+        drop(analytics_sink);
+        handle.join().await;
+    }
 
     // Stop recording: final flush, then persist the final session status.
     if let Some(rec) = &recorder {

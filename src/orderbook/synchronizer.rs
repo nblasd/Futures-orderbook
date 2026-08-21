@@ -466,7 +466,7 @@ mod tests {
         // First bridging event: U <= 100 AND u >= 100
         // Event u=101 has U=100 <= 100 AND u=101 >= 100 ✓
         // Event u=102 has U=101 > 100 ✗ (but it's after the bridge)
-        assert!(events.len() >= 1);
+        assert!(!events.is_empty());
         assert_eq!(events[0].final_update_id, 101);
     }
 
@@ -586,7 +586,7 @@ mod tests {
         // Snapshot lastUpdateId=100
         // Stale events (u < 100) discarded, bridge found, chain extracted
         let events = sync.reconcile(100).unwrap();
-        assert!(events.len() >= 1);
+        assert!(!events.is_empty());
 
         // The buffer must be empty after reconciliation.
         // All remaining events were either applied (returned) or discarded

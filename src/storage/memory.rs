@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use super::{LevelChangeRow, RawEventRow, SnapshotRow, Storage, TradeRow};
+use super::{
+    AnalyticsEventRow, AnalyticsSnapshotRow, DeltaByPriceRow, LevelChangeRow, LiquidityEventRow,
+    RawEventRow, SnapshotRow, Storage, TradeRow,
+};
 use crate::recording::session::SessionRecord;
 
 /// Contents of the in-memory database.
@@ -20,6 +23,10 @@ pub struct MemoryDb {
     pub trades: Vec<TradeRow>,
     pub level_changes: Vec<LevelChangeRow>,
     pub snapshots: Vec<SnapshotRow>,
+    pub analytics_snapshots: Vec<AnalyticsSnapshotRow>,
+    pub analytics_events: Vec<AnalyticsEventRow>,
+    pub delta_by_price: Vec<DeltaByPriceRow>,
+    pub liquidity_events: Vec<LiquidityEventRow>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -269,6 +276,113 @@ impl Storage for MemoryStorage {
         Ok(raw + db.trades.len() as u64 * 64 + db.level_changes.len() as u64 * 48)
     }
 
+    async fn insert_analytics_snapshots(
+        &self,
+        batch: &[AnalyticsSnapshotRow],
+    ) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .analytics_snapshots
+            .extend_from_slice(batch);
+        Ok(())
+    }
+
+    async fn insert_analytics_events(&self, batch: &[AnalyticsEventRow]) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .analytics_events
+            .extend_from_slice(batch);
+        Ok(())
+    }
+
+    async fn insert_delta_by_price(&self, batch: &[DeltaByPriceRow]) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .delta_by_price
+            .extend_from_slice(batch);
+        Ok(())
+    }
+
+    async fn insert_liquidity_events(&self, batch: &[LiquidityEventRow]) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .liquidity_events
+            .extend_from_slice(batch);
+        Ok(())
+    }
+
+    async fn read_analytics_snapshots(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<AnalyticsSnapshotRow>> {
+        let mut rows: Vec<AnalyticsSnapshotRow> = in_session(
+            &self.db.lock().unwrap().analytics_snapshots,
+            session_id,
+            |r| r.session_id,
+        );
+        rows.sort_by_key(|r| r.timestamp_ms);
+        Ok(rows)
+    }
+
+    async fn read_analytics_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<AnalyticsEventRow>> {
+        let mut rows: Vec<AnalyticsEventRow> =
+            in_session(&self.db.lock().unwrap().analytics_events, session_id, |r| {
+                r.session_id
+            });
+        rows.sort_by_key(|r| r.ts_ms);
+        Ok(rows)
+    }
+
+    async fn read_delta_by_price(&self, session_id: Uuid) -> anyhow::Result<Vec<DeltaByPriceRow>> {
+        let mut rows: Vec<DeltaByPriceRow> =
+            in_session(&self.db.lock().unwrap().delta_by_price, session_id, |r| {
+                r.session_id
+            });
+        rows.sort_by_key(|r| r.price);
+        Ok(rows)
+    }
+
+    async fn read_liquidity_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<LiquidityEventRow>> {
+        let mut rows: Vec<LiquidityEventRow> =
+            in_session(&self.db.lock().unwrap().liquidity_events, session_id, |r| {
+                r.session_id
+            });
+        rows.sort_by_key(|r| r.ts_ms);
+        Ok(rows)
+    }
+
+    async fn count_analytics_snapshots(&self, session_id: Uuid) -> anyhow::Result<u64> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .analytics_snapshots
+            .iter()
+            .filter(|r| r.session_id == session_id)
+            .count() as u64)
+    }
+
+    async fn count_analytics_events(&self, session_id: Uuid) -> anyhow::Result<u64> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .analytics_events
+            .iter()
+            .filter(|r| r.session_id == session_id)
+            .count() as u64)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -435,6 +549,58 @@ impl Storage for FlakyStorage {
 
     async fn database_size(&self) -> anyhow::Result<u64> {
         self.inner.database_size().await
+    }
+
+    async fn insert_analytics_snapshots(
+        &self,
+        batch: &[AnalyticsSnapshotRow],
+    ) -> anyhow::Result<()> {
+        self.inner.insert_analytics_snapshots(batch).await
+    }
+
+    async fn insert_analytics_events(&self, batch: &[AnalyticsEventRow]) -> anyhow::Result<()> {
+        self.inner.insert_analytics_events(batch).await
+    }
+
+    async fn insert_delta_by_price(&self, batch: &[DeltaByPriceRow]) -> anyhow::Result<()> {
+        self.inner.insert_delta_by_price(batch).await
+    }
+
+    async fn insert_liquidity_events(&self, batch: &[LiquidityEventRow]) -> anyhow::Result<()> {
+        self.inner.insert_liquidity_events(batch).await
+    }
+
+    async fn read_analytics_snapshots(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<AnalyticsSnapshotRow>> {
+        self.inner.read_analytics_snapshots(session_id).await
+    }
+
+    async fn read_analytics_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<AnalyticsEventRow>> {
+        self.inner.read_analytics_events(session_id).await
+    }
+
+    async fn read_delta_by_price(&self, session_id: Uuid) -> anyhow::Result<Vec<DeltaByPriceRow>> {
+        self.inner.read_delta_by_price(session_id).await
+    }
+
+    async fn read_liquidity_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<LiquidityEventRow>> {
+        self.inner.read_liquidity_events(session_id).await
+    }
+
+    async fn count_analytics_snapshots(&self, session_id: Uuid) -> anyhow::Result<u64> {
+        self.inner.count_analytics_snapshots(session_id).await
+    }
+
+    async fn count_analytics_events(&self, session_id: Uuid) -> anyhow::Result<u64> {
+        self.inner.count_analytics_events(session_id).await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

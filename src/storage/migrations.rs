@@ -28,6 +28,22 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "005_create_order_book_snapshots",
         include_str!("../../migrations/005_create_order_book_snapshots.sql"),
     ),
+    (
+        "006_create_analytics_snapshots",
+        include_str!("../../migrations/006_create_analytics_snapshots.sql"),
+    ),
+    (
+        "007_create_analytics_events",
+        include_str!("../../migrations/007_create_analytics_events.sql"),
+    ),
+    (
+        "008_create_delta_by_price",
+        include_str!("../../migrations/008_create_delta_by_price.sql"),
+    ),
+    (
+        "009_create_liquidity_events",
+        include_str!("../../migrations/009_create_liquidity_events.sql"),
+    ),
 ];
 
 /// Apply all pending migrations. Idempotent.
