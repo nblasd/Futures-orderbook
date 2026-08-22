@@ -135,6 +135,8 @@ impl AnalyticsEngine {
                 let changes = self.book.apply_update(bid_changes, ask_changes, *update_id);
                 for change in &changes {
                     let mut evs = self.liquidity.on_level_change(change, *event_time_ms);
+                    // Feed level change into the heatmap for resting liquidity.
+                    self.heatmap.on_level_change(change, *event_time_ms);
                     // Feed replenishment evidence into absorption windows.
                     if change.new_qty > change.old_qty.unwrap_or(0) {
                         self.absorption.on_liquidity_change(
@@ -148,6 +150,15 @@ impl AnalyticsEngine {
                         change.new_qty,
                         *event_time_ms,
                     );
+                    // Map replenishment events into heatmap cells.
+                    for ev in &evs {
+                        if ev.kind == AnalyticsEventKind::LiquidityReplenishment {
+                            if let Some(price) = ev.price {
+                                self.heatmap.on_replenishment(price, ev.ts_ms);
+                                self.replenishment_count += 1;
+                            }
+                        }
+                    }
                     out.events.append(&mut evs);
                 }
                 // Book-state anomalies.
@@ -229,6 +240,8 @@ impl AnalyticsEngine {
         if let Some(ev) = self.large_trades.check(trade) {
             self.large_trade_count += 1;
             self.flow.record_large_trade(trade.price_ticks);
+            // Update heatmap large_trade_volume at this price.
+            self.heatmap.on_large_trade(trade);
             out.events.push(ev);
         }
 
@@ -252,6 +265,10 @@ impl AnalyticsEngine {
             );
             if let Some(ev) = self.sweeps.on_cluster(&cluster) {
                 self.sweep_candidate_count += 1;
+                // Map sweep event into heatmap cell.
+                if let Some(price) = ev.price {
+                    self.heatmap.on_sweep(price, ev.ts_ms);
+                }
                 out.events.push(ev);
             }
         }
@@ -271,6 +288,10 @@ impl AnalyticsEngine {
             if let Some(best) = best_price {
                 if let Some(ev) = self.absorption.on_trade(trade, best, opposing_liquidity) {
                     self.absorption_candidate_count += 1;
+                    // Map absorption event into heatmap cell.
+                    if let Some(price) = ev.price {
+                        self.heatmap.on_absorption(price, ev.ts_ms);
+                    }
                     out.events.push(ev);
                 }
             }
@@ -360,6 +381,11 @@ impl AnalyticsEngine {
             liquidity_removed: self.liquidity.removed_ticks,
             ..self.flow.digest()
         }
+    }
+
+    /// Deterministic heatmap digest for live/replay comparison.
+    pub fn heatmap_digest(&self) -> crate::analytics::heatmap::HeatmapDigest {
+        self.heatmap.digest()
     }
 
     fn ts_of_ev(&self, ev: &MarketEvent) -> u64 {

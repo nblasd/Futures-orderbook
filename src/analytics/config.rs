@@ -71,6 +71,15 @@ pub struct AnalyticsConfig {
     pub cluster_price_range_ticks: u64,
     /// Minimum confidence (0..1) to emit a sweep/absorption candidate.
     pub confidence_threshold: f64,
+    /// Heatmap price aggregation factor: how many base ticks per grid tick.
+    /// Default 1 = 1 exchange tick per cell. Supported: 1, 5, 10, 25, 50.
+    pub heatmap_price_aggregation: u64,
+    /// Available time bucket intervals for the heatmap (ms).
+    /// Default includes: 100, 250, 500, 1s, 2s, 5s, 10s, 30s, 1m.
+    pub heatmap_time_intervals: Vec<u64>,
+    /// Maximum number of distinct price levels the heatmap will track.
+    /// When exceeded, oldest-price levels are pruned. 0 = unlimited.
+    pub max_heatmap_price_levels: usize,
 }
 
 impl AnalyticsConfig {
@@ -96,6 +105,11 @@ impl AnalyticsConfig {
             cluster_window_ms: 100,
             cluster_price_range_ticks: 3,
             confidence_threshold: 0.5,
+            heatmap_price_aggregation: 1,
+            heatmap_time_intervals: vec![
+                100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000,
+            ],
+            max_heatmap_price_levels: 10_000,
         }
     }
 
@@ -115,6 +129,17 @@ impl AnalyticsConfig {
     pub fn cluster_price_range_raw(&self) -> u64 {
         self.cluster_price_range_ticks
             .saturating_mul(self.tick_size_ticks)
+    }
+
+    /// The price aggregation factor for the heatmap (1, 5, 10, 25, or 50).
+    /// Default 1 means 1 exchange tick per cell.
+    pub fn heatmap_price_aggregation_raw(&self) -> u64 {
+        self.heatmap_price_aggregation
+    }
+
+    /// The configured time bucket intervals for the heatmap.
+    pub fn heatmap_time_intervals(&self) -> &Vec<u64> {
+        &self.heatmap_time_intervals
     }
 }
 
@@ -152,5 +177,15 @@ mod tests {
         assert_eq!(AnalyticsConfig::clamp_score(-0.5), 0.0);
         assert_eq!(AnalyticsConfig::clamp_score(0.7), 0.7);
         assert_eq!(AnalyticsConfig::clamp_score(1.5), 1.0);
+    }
+
+    #[test]
+    fn test_heatmap_default_aggregation_is_1() {
+        let cfg = AnalyticsConfig::btcusdt_default();
+        assert_eq!(cfg.heatmap_price_aggregation, 1);
+        assert_eq!(
+            cfg.heatmap_time_intervals,
+            vec![100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000]
+        );
     }
 }

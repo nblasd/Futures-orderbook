@@ -354,6 +354,140 @@ Thresholds expressed in BTC or ticks are converted to exact ticks via `(x · 1e8
 
 ---
 
+## Phase 5 — Real-Time Price × Time Heatmap Engine
+
+A production-quality, deterministic, real-time **PRICE × TIME market heatmap** data engine for
+BTCUSDT PERPETUAL on Binance USDⓈ-M Futures.
+
+> **This heatmap represents visible public order-book liquidity and executions derived from
+> Binance USDⓈ-M Futures market data. It does not represent hidden liquidity.**
+> Binance's public depth feeds do not expose every possible source of liquidity.
+
+### Architecture
+
+```
+Binance
+  ↓
+MarketEvent
+  ↓
+Order Book + Trade Normalizer
+  ↓
+AnalyticsEngine (Phase 4)
+  ↓
+HeatmapEngine (Phase 5)
+  ↓
+HeatmapFrame / HeatmapDelta
+  ↓
+future renderer
+```
+
+Phase 5 consumes existing normalized market/analytics state — it does not duplicate Binance ingestion,
+order-book processing, or trade normalization.
+
+### Price Grid
+
+Uses the existing integer tick representation (1e8 scale). Supports configurable aggregation:
+
+| Factor | Meaning |
+|--------|---------|
+| 1× | 1 exchange tick per cell (default) |
+| 5× | 5 ticks per cell |
+| 10× | 10 ticks per cell |
+| 25× | 25 ticks per cell |
+| 50× | 50 ticks per cell |
+
+### Time Grid
+
+Configurable bucket intervals:
+
+`100ms · 250ms · 500ms · 1s · 2s · 5s · 10s · 30s · 1m`
+
+Event timestamps (not wall-clock) are authoritative for bucketing.
+
+### HeatmapCell Fields
+
+| Field | Description |
+|-------|-------------|
+| `price` | Grid-aligned price tick (integer, 1e8 scale) |
+| `resting_bid_liquidity` | Visible bid liquidity at this price |
+| `resting_ask_liquidity` | Visible ask liquidity at this price |
+| `liquidity_added` | Cumulative liquidity added |
+| `liquidity_removed` | Cumulative liquidity removed |
+| `executed_buy_volume` | Aggressive buy volume |
+| `executed_sell_volume` | Aggressive sell volume |
+| `delta` | Buy − sell volume |
+| `trade_count` | Number of trades |
+| `large_trade_volume` | Volume from large-trade candidates |
+| `replenishment_count` | Replenishment events at this price |
+| `absorption_candidate_count` | Absorption candidates at this price |
+| `sweep_count` | Sweep candidates at this price |
+| `pressure` | Net buy pressure (running aggregate) |
+| `timestamp_bucket` | Time bucket start (ms since epoch) |
+
+### Resting Liquidity vs. Executed Volume
+
+These are **separate concepts**. A price can have `$10M resting liquidity` and `$2M executed volume`
+in the same time bucket. The heatmap preserves this distinction.
+
+### Intensity Methods
+
+Deterministic, normalised numeric fields for rendering:
+
+| Method | Range | Description |
+|--------|-------|-------------|
+| `liquidity_intensity(max)` | [0, 1] | Resting liquidity as fraction of peak |
+| `execution_intensity(max)` | [0, 1] | Executed volume as fraction of peak |
+| `delta_intensity(max)` | [0, 1] | |delta| as fraction of peak |
+| `absorption_intensity(max)` | [0, 1] | Absorption count as fraction of peak |
+| `sweep_intensity(max)` | [0, 1] | Sweep count as fraction of peak |
+
+The renderer decides the visual palette; these produce values for colour-intensity scalars.
+
+### Multiple Visual Modes
+
+One heatmap data model supports: **Liquidity**, **Execution**, **Delta**, **Absorption**, **Sweep**,
+and **Pressure** modes — no separate engines.
+
+### HeatmapDigest
+
+A deterministic fingerprint for live/replay comparison. Identical `MarketEvent` streams produce
+identical digests. Fields include: bucket count, price level count, all volume/delta/liquidity
+totals, and sweep/absorption/replenishment counts.
+
+### Bounded Memory
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `retention_ms` | 900,000 (15 min) | Prune buckets older than this |
+| `max_heatmap_price_levels` | 10,000 | Maximum tracked price levels |
+| `heatmap_cell_ms` | 1,000 | Time bucket width |
+
+### Serialization
+
+All frame/snapshot/delta types derive `serde::Serialize` + `serde::Deserialize` (JSON-compatible).
+
+### Persistence Strategy
+
+Heatmap data is **derived** data. Raw market events remain the authoritative source. Derived
+heatmap records can be persisted as JSON snapshots, but loss is always recoverable by replaying
+raw events.
+
+### Live + Replay Compatibility
+
+The exact same `HeatmapEngine` works in both live and replay. No separate implementations.
+
+### Run
+
+```bash
+# Live with heatmap
+cargo run --release -- --symbol BTCUSDT --duration 60 --record --analytics
+
+# Replay with heatmap
+cargo run --release -- replay --speed 0 --analytics
+```
+
+---
+
 ## Running
 
 ### Prerequisites

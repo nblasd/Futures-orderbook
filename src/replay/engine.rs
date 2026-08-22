@@ -7,6 +7,7 @@
 
 use crate::analytics::config::AnalyticsConfig;
 use crate::analytics::engine::AnalyticsEngine;
+use crate::analytics::heatmap::HeatmapDigest;
 use crate::analytics::snapshot::AnalyticsFlowDigest;
 use crate::events::market::MarketEvent;
 use crate::orderbook::book::OrderBook;
@@ -59,6 +60,8 @@ pub struct ReplayOutcome {
     pub duration_ns: u128,
     /// Deterministic analytics flow digest (only when replay analytics enabled).
     pub analytics_digest: Option<AnalyticsFlowDigest>,
+    /// Deterministic heatmap digest (only when replay analytics enabled).
+    pub heatmap_digest: Option<HeatmapDigest>,
 }
 
 /// Run a replay over the given session data.
@@ -228,6 +231,7 @@ pub async fn run_replay(data: SessionData, config: ReplayConfig) -> anyhow::Resu
 
     if let Some(engine) = analytics.as_ref() {
         outcome.analytics_digest = Some(engine.digest());
+        outcome.heatmap_digest = Some(engine.heatmap_digest());
     }
 
     Ok(outcome)

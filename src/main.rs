@@ -190,6 +190,9 @@ async fn cmd_replay(config: &Config, args: &ReplayArgs) -> anyhow::Result<()> {
     if let Some(digest) = &outcome.analytics_digest {
         println!("Analytics digest: {}", digest.summarize());
     }
+    if let Some(hm_digest) = &outcome.heatmap_digest {
+        println!("Heatmap digest: {}", hm_digest.summarize());
+    }
     Ok(())
 }
 
@@ -838,6 +841,8 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
         let (final_snapshot, delta_rows) = {
             let mut eng = engine.lock().unwrap();
             info!("Analytics digest (live): {}", eng.digest().summarize());
+            let hm_digest = eng.heatmap_digest();
+            info!("Heatmap digest: {}", hm_digest.summarize());
             let snapshot = eng.force_snapshot();
             let mut rows = Vec::new();
             if let Some(ts) = eng.last_event_ts() {
