@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -297,9 +299,15 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
         );
     }
 
+    // Auto-enable analytics when WebSocket server is active (needs heatmap).
+    let analytics_enabled = config.analytics || config.ws_server;
+    if config.ws_server && !config.analytics {
+        info!("WebSocket server requires analytics — enabling");
+    }
+
     // Phase 4 analytics setup. The engine is synchronous and sits behind a
     // std Mutex; it consumes the same MarketEvent stream the book does.
-    let analytics_engine: Option<std::sync::Mutex<AnalyticsEngine>> = if config.analytics {
+    let analytics_engine: Option<std::sync::Mutex<AnalyticsEngine>> = if analytics_enabled {
         Some(std::sync::Mutex::new(AnalyticsEngine::new(
             config.analytics_config(),
         )))
@@ -307,7 +315,7 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
         None
     };
     let mut analytics_sink_handle: Option<AnalyticsSinkHandle> = None;
-    let analytics_sink: Option<AnalyticsSink> = match (config.analytics, config.record) {
+    let analytics_sink: Option<AnalyticsSink> = match (analytics_enabled, config.record) {
         (true, true) => {
             let storage = recording_storage
                 .clone()
@@ -324,6 +332,76 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
         uuid::Uuid::nil()
     };
 
+    // --- Phase 6 WebSocket server (optional) ---
+    let ws_frame_tx: Option<
+        tokio::sync::broadcast::Sender<futures_orderbook::server::HeatmapFrameSerde>,
+    > = if config.ws_server {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        Some(tx)
+    } else {
+        None
+    };
+    let ws_delta_tx: Option<
+        tokio::sync::broadcast::Sender<futures_orderbook::server::HeatmapDeltaSerde>,
+    > = if config.ws_server {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        Some(tx)
+    } else {
+        None
+    };
+    let ws_status_tx: Option<
+        tokio::sync::broadcast::Sender<futures_orderbook::server::StatusInfo>,
+    > = if config.ws_server {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        Some(tx)
+    } else {
+        None
+    };
+
+    if config.ws_server {
+        let addr: SocketAddr = ([0, 0, 0, 0], config.ws_port).into();
+        let frontend_dir: PathBuf = config.frontend_dir.as_str().into();
+        let replay_controller = std::sync::Arc::new(tokio::sync::RwLock::new(
+            futures_orderbook::server_replay::ReplayController::new(
+                ws_frame_tx.clone().unwrap(),
+                ws_delta_tx.clone().unwrap(),
+                ws_status_tx.clone().unwrap(),
+            ),
+        ));
+        let storage_for_server = recording_storage.clone();
+        futures_orderbook::server::start_server(
+            addr,
+            frontend_dir,
+            ws_frame_tx.clone().unwrap(),
+            ws_delta_tx.clone().unwrap(),
+            ws_status_tx.clone().unwrap(),
+            Some(replay_controller),
+            storage_for_server,
+        );
+        info!("Phase 6 WebSocket server started on {addr}");
+
+        // If --replay-session was provided, auto-start replay
+        if let Some(ref session_id_str) = config.replay_session {
+            if let Ok(sid) = uuid::Uuid::parse_str(session_id_str) {
+                let storage = recording_storage.clone();
+                let frame_tx = ws_frame_tx.clone().unwrap();
+                let delta_tx = ws_delta_tx.clone().unwrap();
+                let status_tx = ws_status_tx.clone().unwrap();
+                let speed = config.replay_speed;
+                tokio::spawn(async move {
+                    let ctl = futures_orderbook::server_replay::ReplayController::new(
+                        frame_tx, delta_tx, status_tx,
+                    );
+                    if let Some(store) = storage {
+                        ctl.load_and_run(store, sid, speed).await;
+                    } else {
+                        warn!("No storage available for replay");
+                    }
+                });
+            }
+        }
+    }
+
     // Main engine loop
     let mut diagnostic_interval =
         tokio::time::interval(Duration::from_secs(config.diagnostic_interval));
@@ -336,6 +414,9 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
     };
 
     let mut awaiting_snapshot: bool = false;
+    let mut ws_frame_interval = tokio::time::interval(Duration::from_millis(250));
+    let mut ws_prev_frame: Option<futures_orderbook::analytics::heatmap::HeatmapFrame> = None;
+    ws_frame_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -821,6 +902,62 @@ async fn cmd_record(config: Config) -> anyhow::Result<()> {
                         info!("Event channel closed");
                         break;
                     }
+                }
+
+
+            }
+
+            // Periodic heatmap frame broadcast for WebSocket clients
+            _ = ws_frame_interval.tick(), if ws_frame_tx.is_some() => {
+                if let (Some(engine), Some(frame_tx), Some(status_tx)) = (
+                    &analytics_engine, &ws_frame_tx, &ws_status_tx
+                ) {
+                    let eng = engine.lock().unwrap();
+                    let heatmap = eng.heatmap();
+                    let now_ms = eng.last_event_ts().unwrap_or(0);
+                    // Use a wide visible range around best bid/ask
+                    let (lo, hi) = {
+                        let book = &eng.book;
+                        let mid = book.mid_price_f64().unwrap_or(77300.0);
+                        let mid_ticks = (mid * 100_000_000.0) as u64;
+                        let range = 50 * 10_000_000; // 50 tick range
+                        (mid_ticks.saturating_sub(range), mid_ticks.saturating_add(range))
+                    };
+                    let frame = futures_orderbook::analytics::heatmap::HeatmapFrame::from_heatmap(
+                        heatmap, now_ms, lo, hi
+                    );
+                    let serde_frame: futures_orderbook::server::HeatmapFrameSerde = (&frame).into();
+
+                    // Compute and broadcast delta if we have a previous frame
+                    if let (Some(delta_tx), Some(prev)) = (&ws_delta_tx, &ws_prev_frame) {
+                        let delta = futures_orderbook::analytics::heatmap::HeatmapDelta::compute(prev, &frame);
+                        let serde_delta: futures_orderbook::server::HeatmapDeltaSerde = (&delta).into();
+                        let _ = delta_tx.send(serde_delta);
+                    }
+                    ws_prev_frame = Some(frame);
+                    drop(eng);
+                    let _ = frame_tx.send(serde_frame);
+
+                    // Also broadcast status
+                    let eng = engine.lock().unwrap();
+                    let book = &eng.book;
+                    let status = futures_orderbook::server::StatusInfo {
+                        connection: if analytics_enabled { "LIVE".into() } else { "DISCONNECTED".into() },
+                        book_status: if book.is_ready() { "READY".into() } else { "BUFFERING".into() },
+                        symbol: config.symbol.clone(),
+                        exchange: "Binance USD\u{2119}-M Futures".into(),
+                        best_bid: book.best_bid().map(|p| p as f64 / 100_000_000.0).unwrap_or(0.0),
+                        best_ask: book.best_ask().map(|p| p as f64 / 100_000_000.0).unwrap_or(0.0),
+                        mid: book.mid_price_f64().unwrap_or(0.0),
+                        spread: book.spread_ticks().map(|s| s as f64 / 100_000_000.0).unwrap_or(0.0),
+                        events_per_sec: 0,
+                        trades_per_sec: 0,
+                        heatmap_cells: eng.heatmap().cell_count(),
+                        sequence_errors: 0,
+                        queue_depth: 0,
+                    };
+                    drop(eng);
+                    let _ = status_tx.send(status);
                 }
             }
         }

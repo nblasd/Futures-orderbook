@@ -9,6 +9,8 @@ pub mod events;
 pub mod orderbook;
 pub mod recording;
 pub mod replay;
+pub mod server;
+pub mod server_replay;
 pub mod storage;
 pub mod trades;
 pub mod verify;

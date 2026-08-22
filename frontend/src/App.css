@@ -1,0 +1,505 @@
+/* ============================================================
+   Dark Trading Terminal Theme — Phase 6 Bookmap UI
+   ============================================================ */
+
+:root {
+  --bg-primary: #0a0a14;
+  --bg-secondary: #0f0f1e;
+  --bg-tertiary: #141428;
+  --bg-panel: #111122;
+  --border: #222244;
+  --text-primary: #e0e0f0;
+  --text-secondary: #8888aa;
+  --text-dim: #555577;
+  --green: #00dd66;
+  --red: #dd3333;
+  --blue: #3388ff;
+  --yellow: #ffcc00;
+  --orange: #ff8800;
+  --purple: #aa44dd;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 12px;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+/* ---- HEADER ---- */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  min-height: 44px;
+  flex-shrink: 0;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.header-symbol {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--yellow);
+}
+
+.header-contract {
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.header-exchange {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.header-center {
+  display: flex;
+  align-items: center;
+}
+
+.book-data {
+  display: flex;
+  gap: 20px;
+}
+
+.book-field {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.book-label {
+  font-size: 9px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.book-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.book-value.bid { color: var(--green); }
+.book-value.ask { color: var(--red); }
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.demo-badge {
+  background: var(--orange);
+  color: #000;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 3px;
+  letter-spacing: 1px;
+}
+
+/* ---- MAIN CONTENT ---- */
+.main-content {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.heatmap-area {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+.heatmap-container {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+.heatmap-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+}
+
+.renderer-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 9px;
+  color: var(--text-dim);
+  background: rgba(0,0,0,0.5);
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+/* ---- TOOLTIP ---- */
+.tooltip {
+  position: fixed;
+  z-index: 1000;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 14px;
+  pointer-events: none;
+  min-width: 200px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+}
+
+.tooltip-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tooltip-price {
+  font-weight: 700;
+  color: var(--yellow);
+  font-size: 13px;
+}
+
+.tooltip-time {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+
+.tooltip-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tooltip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 11px;
+}
+
+.tooltip-row span:first-child {
+  color: var(--text-secondary);
+}
+
+.tooltip-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 3px 0;
+}
+
+.green { color: var(--green); }
+.red { color: var(--red); }
+
+/* ---- PRICE LADDER ---- */
+.price-ladder {
+  width: 220px;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.ladder-header {
+  padding: 6px 12px;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ladder-body {
+  flex: 1;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.ladder-row {
+  display: flex;
+  align-items: center;
+  height: 20px;
+  position: relative;
+  font-size: 10px;
+}
+
+.ladder-price {
+  width: 70px;
+  text-align: center;
+  color: var(--text-primary);
+  font-size: 11px;
+  z-index: 1;
+}
+
+.ladder-bid-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: rgba(0, 220, 100, 0.15);
+}
+
+.ladder-ask-bar {
+  position: absolute;
+  right: 0;
+  top: 0;
+  height: 100%;
+  background: rgba(220, 50, 50, 0.15);
+}
+
+.ladder-bid-vol,
+.ladder-ask-vol {
+  width: 70px;
+  text-align: center;
+  font-size: 9px;
+  color: var(--text-secondary);
+  z-index: 1;
+}
+
+/* ---- FLOW PANEL ---- */
+.flow-panel {
+  display: flex;
+  align-items: center;
+  padding: 4px 16px;
+  background: var(--bg-tertiary);
+  border-top: 1px solid var(--border);
+  min-height: 36px;
+  flex-shrink: 0;
+  gap: 16px;
+}
+
+.flow-label {
+  font-size: 9px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  white-space: nowrap;
+}
+
+.flow-fields {
+  display: flex;
+  gap: 16px;
+}
+
+.flow-field {
+  display: flex;
+  gap: 4px;
+  align-items: baseline;
+}
+
+.flow-name {
+  color: var(--text-dim);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.flow-value {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.flow-stats {
+  margin-left: auto;
+  display: flex;
+  gap: 12px;
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+.flow-empty {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* ---- BOTTOM BAR ---- */
+.bottom-bar {
+  display: flex;
+  align-items: center;
+  padding: 4px 16px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  min-height: 36px;
+  flex-shrink: 0;
+  gap: 16px;
+}
+
+/* ---- CONTROLS ---- */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.control-label {
+  font-size: 8px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-right: 4px;
+}
+
+.control-buttons {
+  display: flex;
+  gap: 2px;
+}
+
+.control-btn {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  font-size: 10px;
+  font-family: inherit;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.control-btn:hover {
+  background: var(--border);
+  color: var(--text-primary);
+}
+
+.control-btn.active {
+  background: var(--blue);
+  color: #fff;
+  border-color: var(--blue);
+}
+
+.control-btn.wide {
+  padding: 3px 12px;
+}
+
+/* ---- MARKET STATUS ---- */
+.market-status {
+  display: flex;
+  gap: 16px;
+  margin-left: auto;
+  font-size: 9px;
+}
+
+.status-section {
+  display: flex;
+  gap: 8px;
+}
+
+.status-row {
+  display: flex;
+  gap: 4px;
+  align-items: baseline;
+}
+
+.status-key {
+  color: var(--text-dim);
+}
+
+.status-val {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.status-val.live { color: var(--green); }
+.status-val.demo { color: var(--orange); }
+.status-val.replay { color: var(--blue); }
+.status-val.disconnected { color: var(--red); }
+
+.stale-warning {
+  color: var(--orange);
+  font-weight: 700;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* ---- KEYBOARD HINTS ---- */
+.keyboard-hints {
+  padding: 2px 16px;
+  font-size: 9px;
+  color: var(--text-dim);
+  background: var(--bg-primary);
+  border-top: 1px solid var(--border);
+  text-align: center;
+  flex-shrink: 0;
+}
+
+/* ---- SCROLLBAR ---- */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}

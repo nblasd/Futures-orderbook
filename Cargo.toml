@@ -20,6 +20,8 @@ chrono = "0.4"
 clickhouse = { version = "0.15.1", features = ["uuid", "chrono"] }
 uuid = { version = "1.24.1", features = ["v4", "serde"] }
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

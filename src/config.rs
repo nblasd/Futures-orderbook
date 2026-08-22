@@ -140,6 +140,26 @@ pub struct Config {
     #[arg(long, default_value = DEFAULT_ANALYTICS_VERSION)]
     pub analytics_version: String,
 
+    /// Enable WebSocket server for the Phase 6 frontend.
+    #[arg(long)]
+    pub ws_server: bool,
+
+    /// WebSocket server port (requires --ws-server).
+    #[arg(long, default_value_t = 8080)]
+    pub ws_port: u16,
+
+    /// Path to the frontend dist directory (requires --ws-server).
+    #[arg(long, default_value = "frontend/dist")]
+    pub frontend_dir: String,
+
+    /// Start in replay mode with the given session ID (requires --ws-server).
+    #[arg(long, requires = "ws_server")]
+    pub replay_session: Option<String>,
+
+    /// Replay speed (requires --replay-session).
+    #[arg(long, default_value_t = 1.0)]
+    pub replay_speed: f64,
+
     /// Subcommand: replay or verify.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -303,6 +323,11 @@ impl Default for Config {
             analytics_retention_seconds: 900,
             tick_size: "0.10".to_string(),
             analytics_version: DEFAULT_ANALYTICS_VERSION.to_string(),
+            ws_server: false,
+            ws_port: 8080,
+            frontend_dir: "frontend/dist".to_string(),
+            replay_session: None,
+            replay_speed: 1.0,
             command: None,
         }
     }
